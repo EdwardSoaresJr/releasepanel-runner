@@ -9,13 +9,11 @@ Use this when replacing **`releasepanel-runner`** (or any prior name) with **`ma
 
 ## 2. Point the control plane at the new bootstrap URL
 
-Set on the **ReleasePanel** app host (or `.env` / secrets):
+Set on the **ReleasePanel** app host (or `.env` / secrets) if the GitHub **repo name** or owner changes:
 
-- `RELEASEPANEL_RUNNER_BOOTSTRAP_INSTALL_URL`  
-  Example:  
-  `https://raw.githubusercontent.com/EdwardSoaresJr/managed-deploy-agent/main/scripts/install-managed-vps.sh`
+- `RELEASEPANEL_RUNNER_BOOTSTRAP_INSTALL_URL` — raw URL to `scripts/install-managed-vps.sh` (e.g. `https://raw.githubusercontent.com/EdwardSoaresJr/releasepanel-runner/main/scripts/install-managed-vps.sh` while the public repo is still **`releasepanel-runner`**).
 
-The default in `config/releasepanel.php` already targets **`managed-deploy-agent`**; adjust org/repo if yours differs.
+The Laravel default in `config/releasepanel.php` tracks the current public repo name; override with env when you rename on GitHub.
 
 Clear config cache after changing env:
 

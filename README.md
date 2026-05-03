@@ -20,14 +20,14 @@ The control plane calls the agent with header **`X-Managed-Agent-Key`** (legacy 
 From the control plane UI, copy the **bootstrap** command, or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/EdwardSoaresJr/managed-deploy-agent/main/scripts/install-managed-vps.sh | \
+curl -fsSL https://raw.githubusercontent.com/EdwardSoaresJr/releasepanel-runner/main/scripts/install-managed-vps.sh | \
   MANAGED_AGENT_PANEL_URL='https://your-control-plane' \
   MANAGED_AGENT_SERVER_ID='server-id-from-panel' \
   MANAGED_AGENT_RUNNER_KEY='runner-key-from-panel' \
   bash -s
 ```
 
-Override the Git URL only for a **public** fork or mirror: **`MANAGED_AGENT_RUNNER_REPO_HTTPS`**.
+The GitHub repo is currently **`releasepanel-runner`**; install still uses **`/opt/managed-deploy-agent`** as the default install directory unless you set **`MANAGED_AGENT_INSTALL_DIR`**. After you rename the repo on GitHub, set **`MANAGED_AGENT_RUNNER_REPO_HTTPS`** (or we will update the default).
 
 ## Self-signed HTTPS control plane (staging)
 

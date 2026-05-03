@@ -17,7 +17,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EdwardSoaresJr/managed-deploy-agent.git"
+    "url": "git+https://github.com/EdwardSoaresJr/releasepanel-runner.git"
   },
   "keywords": [
     "deploy",

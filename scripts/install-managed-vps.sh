@@ -6,7 +6,9 @@ export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
 
 readonly DEPLOY_ROOT="/opt"
-readonly DEFAULT_RUNNER_BUNDLE_HTTPS="https://github.com/EdwardSoaresJr/managed-deploy-agent.git"
+# Canonical public Git URL (must be cloneable without auth). GitHub repo is still
+# named releasepanel-runner until renamed; override with MANAGED_AGENT_RUNNER_REPO_HTTPS when you publish under another name.
+readonly DEFAULT_RUNNER_BUNDLE_HTTPS="https://github.com/EdwardSoaresJr/releasepanel-runner.git"
 readonly RUNNER_REPO_DIR="${MANAGED_AGENT_INSTALL_DIR:-${DEPLOY_ROOT}/managed-deploy-agent}"
 readonly RUNNER_REPO_HTTPS="${MANAGED_AGENT_RUNNER_REPO_HTTPS:-${RELEASEPANEL_RUNNER_REPO_HTTPS:-${DEFAULT_RUNNER_BUNDLE_HTTPS}}}"
 
