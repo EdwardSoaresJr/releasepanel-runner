@@ -290,7 +290,7 @@ main() {
 
     [ -f "${INSTALL_ROOT}/server.js" ] || die "${INSTALL_ROOT}/server.js missing after clone."
     TOOLKIT="${INSTALL_ROOT}/toolkit"
-    [ -f "${TOOLKIT}/scripts/join-panel.sh" ] || die "toolkit missing at ${TOOLKIT}/scripts/join-panel.sh — use the releasepanel-runner bundle that vendors toolkit/."
+    [ -f "${TOOLKIT}/scripts/join-panel.sh" ] || die "toolkit missing ${TOOLKIT}/scripts/join-panel.sh — use a releasepanel-runner commit that vendors toolkit/ (join-panel ships in toolkit/scripts). Try: rm -rf ${INSTALL_ROOT} and re-run this installer, or: git -C ${INSTALL_ROOT} pull --ff-only origin ${DEFAULT_BRANCH}"
 
     SKIP_JOIN=0
     if agent_env_has_runner_key; then
