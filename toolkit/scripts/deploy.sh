@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+. "${SCRIPT_DIR}/../lib/common.sh"
+
+require_root
+if ! parse_deploy_env_as_first_arg "${1:-}"; then
+    fail "Usage: ${0##*/} <site-env> [options]"
+fi
+shift
+load_env
+require_env_value RELEASEPANEL_REPO
+require_composer
+
+if [ ! -x "$(command -v "php${RELEASEPANEL_PHP_VERSION}" 2>/dev/null || true)" ] || [ ! -S "/run/php/php${RELEASEPANEL_PHP_VERSION}-fpm.sock" ]; then
+    "${SCRIPT_DIR}/install-php-runtime.sh" "${RELEASEPANEL_PHP_VERSION}"
+fi
+
+skip_migrations=false
+tenant_migrations="${RELEASEPANEL_ENABLE_TENANT_MIGRATIONS}"
+route_cache=true
+skip_smoke=false
+rollback_on_smoke_fail=false
+require_redis=false
+require_db=false
+rollback_on_https_fail=false
+skip_https_validation=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-migrations) skip_migrations=true ;;
+        --tenant-migrations) tenant_migrations=true ;;
+        --route-cache) route_cache=true ;;
+        --skip-route-cache) route_cache=false ;;
+        --skip-smoke) skip_smoke=true ;;
+        --rollback-on-smoke-fail) rollback_on_smoke_fail=true ;;
+        --require-redis) require_redis=true ;;
+        --require-db) require_db=true ;;
+        --skip-https-validation) skip_https_validation=true ;;
+        --rollback-on-http-fail|--rollback-on-https-fail) rollback_on_https_fail=true ;;
+        *) fail "Unknown option: $1" ;;
+    esac
+    shift
+done
+
+ensure_app_layout
+
+if [ "${require_redis}" = "true" ]; then
+    command -v redis-cli >/dev/null 2>&1 || fail "redis-cli is required for --require-redis."
+    redis-cli ping | grep -qx 'PONG' || fail "Redis is not responding with PONG."
+    [ -f "${RELEASEPANEL_SHARED}/.env" ] || fail "--require-redis expects ${RELEASEPANEL_SHARED}/.env to exist."
+    if ! grep -q '^QUEUE_CONNECTION=redis$' "${RELEASEPANEL_SHARED}/.env"; then
+        fail "--require-redis expects QUEUE_CONNECTION=redis in ${RELEASEPANEL_SHARED}/.env."
+    fi
+fi
+
+if [ "${require_db}" = "true" ]; then
+    [ -f "${RELEASEPANEL_SHARED}/.env" ] || fail "--require-db expects ${RELEASEPANEL_SHARED}/.env to exist."
+    grep -q '^DB_CONNECTION=.' "${RELEASEPANEL_SHARED}/.env" || fail "--require-db expects DB_CONNECTION in ${RELEASEPANEL_SHARED}/.env."
+    grep -q '^DB_DATABASE=.' "${RELEASEPANEL_SHARED}/.env" || fail "--require-db expects DB_DATABASE in ${RELEASEPANEL_SHARED}/.env."
+fi
+
+acquire_deploy_lock
+
+release="${RELEASEPANEL_RELEASES}/$(date +%Y%m%d%H%M%S)"
+RELEASE_PATH="${release}"
+previous_current=""
+first_deploy=true
+if [ -L "${RELEASEPANEL_CURRENT}" ]; then
+    previous_current="$(readlink -f "${RELEASEPANEL_CURRENT}")"
+    first_deploy=false
+fi
+
+log "Starting release deploy to ${release}."
+echo "[releasepanel] Step: Cloning repository"
+if [ -n "${RELEASEPANEL_SSH_IDENTITY_FILE:-}" ] && [[ "${RELEASEPANEL_SSH_IDENTITY_FILE}" == /root/* ]]; then
+    GIT_SSH_COMMAND="${RELEASEPANEL_GIT_SSH_COMMAND}" git clone --no-checkout "${RELEASEPANEL_REPO}" "${release}"
+    GIT_SSH_COMMAND="${RELEASEPANEL_GIT_SSH_COMMAND}" git -C "${release}" fetch origin "${RELEASEPANEL_BRANCH}"
+    if [ -n "${RELEASEPANEL_DEPLOY_COMMIT_SHA:-}" ]; then
+        git -C "${release}" checkout --force "${RELEASEPANEL_DEPLOY_COMMIT_SHA}"
+    else
+        git -C "${release}" checkout --force -B "${RELEASEPANEL_BRANCH}" "origin/${RELEASEPANEL_BRANCH}"
+    fi
+    chown -R "${RELEASEPANEL_APP_USER}:${RELEASEPANEL_FILE_GROUP}" "${release}"
+elif [ -d "${RELEASEPANEL_REPO}/.git" ]; then
+    git \
+        -c "safe.directory=${RELEASEPANEL_REPO}" \
+        -c "safe.directory=${RELEASEPANEL_REPO}/.git" \
+        clone --no-checkout "${RELEASEPANEL_REPO}" "${release}"
+    git -C "${release}" fetch origin "${RELEASEPANEL_BRANCH}"
+    if [ -n "${RELEASEPANEL_DEPLOY_COMMIT_SHA:-}" ]; then
+        git -C "${release}" checkout --force "${RELEASEPANEL_DEPLOY_COMMIT_SHA}"
+    else
+        git -C "${release}" checkout --force -B "${RELEASEPANEL_BRANCH}" "origin/${RELEASEPANEL_BRANCH}"
+    fi
+    chown -R "${RELEASEPANEL_APP_USER}:${RELEASEPANEL_FILE_GROUP}" "${release}"
+else
+    run_as_app_user git clone --no-checkout "${RELEASEPANEL_REPO}" "${release}"
+    run_as_app_user_in "${release}" git fetch origin "${RELEASEPANEL_BRANCH}"
+    if [ -n "${RELEASEPANEL_DEPLOY_COMMIT_SHA:-}" ]; then
+        run_as_app_user_in "${release}" git checkout --force "${RELEASEPANEL_DEPLOY_COMMIT_SHA}"
+    else
+        run_as_app_user_in "${release}" git checkout --force -B "${RELEASEPANEL_BRANCH}" "origin/${RELEASEPANEL_BRANCH}"
+    fi
+fi
+sha="$(run_as_app_user_in "${release}" git rev-parse HEAD)"
+promote_app_subdir_release
+
+echo "[releasepanel] Step: Linking shared .env and storage"
+link_shared_paths
+echo "[releasepanel] Step: Preparing release filesystem"
+prepare_release_filesystem
+
+echo "[releasepanel] Step: Running composer install"
+if ! run_as_app_user_in "${release}" "$(php_binary)" "$(releasepanel_composer_path)" install --no-dev --prefer-dist --optimize-autoloader --no-scripts --no-interaction; then
+    write_deploy_stamp "${release}" "failed-composer" "${sha}"
+    fail "Composer install failed. current symlink remains unchanged."
+fi
+
+validate_release_ready
+
+if [ "${first_deploy}" != "true" ]; then
+    validate_shared_env_for_artisan
+    safe_artisan "package:discover"
+    safe_artisan "config:clear"
+    safe_artisan "cache:clear"
+fi
+
+detect_and_run_asset_build "${release}"
+
+validate_release_ready
+
+if [ "${first_deploy}" = "true" ]; then
+    warn "First deploy detected; skipping migrations until real shared .env is configured."
+elif [ "${skip_migrations}" != "true" ]; then
+    validate_shared_env_for_artisan
+    if [ "${require_db}" = "true" ]; then
+        echo "[releasepanel] Step: Checking database connectivity"
+        artisan_in_release "${release}" migrate:status --no-interaction >/dev/null
+    fi
+    safe_artisan "migrate --force"
+    if [ "${tenant_migrations}" = "true" ]; then
+        safe_artisan "tenants:migrate --force"
+    fi
+else
+    warn "Skipping migrations by request."
+fi
+
+echo "[releasepanel] Step: Switching current symlink"
+ln -sfn "${release}" "${RELEASEPANEL_CURRENT}.new"
+mv -Tf "${RELEASEPANEL_CURRENT}.new" "${RELEASEPANEL_CURRENT}"
+chown -h "${RELEASEPANEL_APP_USER}:${RELEASEPANEL_FILE_GROUP}" "${RELEASEPANEL_CURRENT}"
+
+if [ "${first_deploy}" = "true" ]; then
+    warn "First deploy detected; skipping cache builds so temporary bootstrap .env is not cached."
+else
+    validate_shared_env_for_artisan
+    echo "[releasepanel] Step: Building Laravel caches"
+    safe_artisan "optimize:clear"
+    safe_artisan "config:cache"
+    if [ "${route_cache}" = "true" ]; then
+        safe_artisan "route:cache"
+    else
+        safe_artisan "route:clear"
+    fi
+    safe_artisan "view:cache"
+fi
+
+echo "[releasepanel] Step: Reloading PHP-FPM and workers"
+reload_php_fpm
+restart_workers
+
+if [ "${RELEASEPANEL_TLS_MODE:-}" = "self-signed" ] && [ ! -f "/etc/letsencrypt/live/${RELEASEPANEL_SERVER_NAME}/fullchain.pem" ]; then
+    echo "[releasepanel] Step: Self-signed TLS nginx (RELEASEPANEL_TLS_MODE=self-signed; no Let's Encrypt certificate yet)"
+    RELEASEPANEL_DEPLOY_ENV="${RELEASEPANEL_DEPLOY_ENV}" bash "${SCRIPT_DIR}/08-nginx-https-selfsigned.sh" "${RELEASEPANEL_SITE_SLUG}-${RELEASEPANEL_ENV_SLUG}"
+fi
+
+smoke_status=0
+if [ "${first_deploy}" = "true" ]; then
+    warn "First deploy detected; skipping smoke tests so missing post-install app bootstrap cannot block current symlink creation."
+elif [ "${skip_smoke}" != "true" ]; then
+    smoke_script="${SCRIPT_DIR}/12-smoke-tests.sh"
+    smoke_args=("${RELEASEPANEL_ENV}")
+    if [ -n "${RELEASEPANEL_SITE_SLUG}" ]; then
+        smoke_script="${SCRIPT_DIR}/site-smoke.sh"
+        smoke_args=("${RELEASEPANEL_SITE_SLUG}" "${RELEASEPANEL_ENV_SLUG}")
+    fi
+
+    if ! RELEASEPANEL_DEPLOY_ENV="${RELEASEPANEL_DEPLOY_ENV}" bash "${smoke_script}" "${smoke_args[@]}"; then
+        smoke_status=1
+    fi
+fi
+
+if [ "${smoke_status}" -ne 0 ]; then
+    write_deploy_stamp "${release}" "failed-smoke" "${sha}"
+    if [ "${rollback_on_smoke_fail}" = "true" ] && [ -n "${previous_current}" ] && [ -f "${previous_current}/vendor/autoload.php" ]; then
+        warn "Smoke failed. Rolling back to ${previous_current}."
+        ln -sfn "${previous_current}" "${RELEASEPANEL_CURRENT}.new"
+        mv -Tf "${RELEASEPANEL_CURRENT}.new" "${RELEASEPANEL_CURRENT}"
+        reload_php_fpm
+        restart_workers
+    fi
+    fail "Deploy completed but smoke tests failed."
+fi
+
+if [ "${skip_https_validation}" = "true" ]; then
+    warn "Skipping HTTPS validation by request."
+elif ! local_https_check true; then
+    write_deploy_stamp "${release}" "failed-https" "${sha}"
+    if [ "${rollback_on_https_fail}" = "true" ] && [ -n "${previous_current}" ] && [ -f "${previous_current}/vendor/autoload.php" ]; then
+        warn "HTTPS check failed. Rolling back to ${previous_current}."
+        ln -sfn "${previous_current}" "${RELEASEPANEL_CURRENT}.new"
+        mv -Tf "${RELEASEPANEL_CURRENT}.new" "${RELEASEPANEL_CURRENT}"
+        reload_php_fpm
+        restart_workers
+    fi
+    fail "Deploy completed but HTTPS validation failed."
+fi
+
+write_deploy_stamp "${release}" "success" "${sha}"
+
+log "Pruning old releases after successful deploy."
+find "${RELEASEPANEL_RELEASES}" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +6 | xargs -r rm -rf
+
+log "Deploy complete: ${sha}."
+print_deploy_summary "${sha}"

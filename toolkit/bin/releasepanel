@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+THIS="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "${THIS}")"
+
+if [ "$(basename "${SCRIPT_DIR}")" = "bin" ] && [ -d "${SCRIPT_DIR}/../scripts" ]; then
+    TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+    TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR:-/opt/managed-deploy-agent/toolkit}"
+fi
+
+usage() {
+    cat <<'EOF'
+Usage:
+  releasepanel bootstrap
+  releasepanel bootstrap-runner
+  releasepanel mysql status
+  releasepanel redis status
+  releasepanel install-php <php-version>
+  releasepanel runner
+  releasepanel server register <releasepanel-url> [server-name] [runner-url]
+  releasepanel site <command> <site> <environment> [options]
+  releasepanel site promote <site> <from-environment> <to-environment>
+
+Site commands:
+  deploy [--skip-route-cache|--strict]
+  preflight
+  status
+  rollback
+  user
+  deploy-key
+  repair
+  nginx
+  selfsigned-nginx
+  ssl
+  workers
+  smoke
+  pdf
+  harden
+
+This toolkit is the managed-server / agent subset only (app sites + runner). It does not install
+or self-update the ReleasePanel control plane. Use `releasepanel site ... workers` for app queues.
+
+Examples:
+  releasepanel bootstrap-runner
+  releasepanel runner
+  releasepanel site deploy my-app production
+EOF
+}
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 0
+fi
+
+first_arg="$1"
+shift
+
+run_script() {
+    local script="$1"
+    shift
+
+    exec bash "${TOOLKIT_DIR}/scripts/${script}" "$@"
+}
+
+resolve_site_env_arg() {
+    local site_env="$1"
+    local env_file
+    local site
+    local env
+
+    for env_file in "${TOOLKIT_DIR}/sites/"*/*.env; do
+        [ -e "${env_file}" ] || continue
+
+        env="$(basename "${env_file}" .env)"
+        site="$(basename "$(dirname "${env_file}")")"
+
+        if [ "${site}-${env}" = "${site_env}" ]; then
+            site_slug="${site}"
+            env_slug="${env}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+run_site_env_script() {
+    local script="$1"
+    local site_slug="$2"
+    local env_slug="$3"
+    shift 3
+
+    RELEASEPANEL_DEPLOY_ENV="${TOOLKIT_DIR}/sites/${site_slug}/${env_slug}.env" \
+        exec bash "${TOOLKIT_DIR}/scripts/${script}" "${site_slug}-${env_slug}" "$@"
+}
+
+case "${first_arg}" in
+    bootstrap)
+        run_script 01-bootstrap.sh "$@"
+        ;;
+    bootstrap-runner)
+        run_script bootstrap-runner.sh "$@"
+        ;;
+    mysql)
+        case "${1:-status}" in
+            status)
+                shift || true
+                run_script mysql-status.sh status "$@"
+                ;;
+            -h | --help | help)
+                echo "Usage: releasepanel mysql status" >&2
+                ;;
+            *)
+                echo "[error] Unknown mysql subcommand: ${1:-}" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    redis)
+        case "${1:-status}" in
+            status)
+                shift || true
+                run_script redis-status.sh "$@"
+                ;;
+            -h | --help | help)
+                echo "Usage: releasepanel redis status" >&2
+                ;;
+            *)
+                echo "[error] Unknown redis subcommand: ${1:-}" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    install-php)
+        if [ $# -ne 1 ]; then
+            usage >&2
+            exit 1
+        fi
+        run_script install-php-runtime.sh "$1"
+        ;;
+    runner)
+        run_script install-runner.sh "$@"
+        ;;
+    server)
+        if [ "${1:-}" != "register" ]; then
+            usage >&2
+            exit 1
+        fi
+        shift
+        run_script register-server.sh "$@"
+        ;;
+    site)
+        if [ $# -lt 2 ]; then
+            usage >&2
+            exit 1
+        fi
+
+        command_name="$1"
+        shift
+
+        if [ "${command_name}" = "promote" ]; then
+            if [ $# -ne 3 ]; then
+                usage >&2
+                exit 1
+            fi
+
+            site_slug="$1"
+            env_slug="$2"
+            promote_target_env="$3"
+            shift 3
+        elif [ $# -ge 2 ] && [ -f "${TOOLKIT_DIR}/sites/${1}/${2}.env" ]; then
+            site_slug="$1"
+            env_slug="$2"
+            shift 2
+        elif resolve_site_env_arg "$1"; then
+            shift
+        else
+            echo "[error] Missing site environment config for: $1" >&2
+            usage >&2
+            exit 1
+        fi
+
+        case "${command_name}" in
+            deploy)
+                run_script site-deploy.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            preflight)
+                run_site_env_script 00-preflight.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            status)
+                run_script site-status.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            rollback)
+                run_script site-rollback.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            repair)
+                run_script site-repair.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            user)
+                run_site_env_script 02-create-app-user.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            deploy-key)
+                run_script site-deploy-key.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            nginx)
+                run_script site-nginx.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            selfsigned-nginx)
+                run_script site-selfsigned-nginx.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            ssl)
+                run_script site-ssl.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            workers)
+                run_script site-workers.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            smoke)
+                run_script site-smoke.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            pdf)
+                run_site_env_script 10-pdf-stack.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            harden)
+                run_site_env_script 11-security-hardening.sh "${site_slug}" "${env_slug}" "$@"
+                ;;
+            promote)
+                run_script site-promote.sh "${site_slug}" "${env_slug}" "${promote_target_env}"
+                ;;
+            *)
+                echo "[error] Unknown site command: ${command_name}" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        echo "[error] Unknown command: ${first_arg}" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

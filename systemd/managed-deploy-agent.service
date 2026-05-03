@@ -1,0 +1,15 @@
+[Unit]
+Description=Managed deploy agent (on-server)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__RUNNER_DIR__
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node __RUNNER_DIR__/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
