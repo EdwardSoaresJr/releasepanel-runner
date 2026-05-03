@@ -101,8 +101,17 @@ function resolvedRunnerVersionLabel() {
 }
 
 function envTruthy(primary, legacy) {
-    const v = process.env[primary] || process.env[legacy];
-    return v === '1' || v === 'true' || v === 'TRUE' || v === 'yes' || v === 'YES' || v === 'on' || v === 'ON';
+ const v = process.env[primary] || process.env[legacy];
+ return v === '1' || v === 'true' || v === 'TRUE' || v === 'yes' || v === 'YES' || v === 'on' || v === 'ON';
+}
+
+/** When unset, default poll on if a panel URL is configured (hosted / NAT installs). Opt out: MANAGED_AGENT_POLL_ENABLED=false */
+function envPollEnabled(panelUrlNormalized) {
+ const raw = process.env.MANAGED_AGENT_POLL_ENABLED || process.env.RELEASEPANEL_POLL_ENABLED;
+ if (raw === undefined || String(raw).trim() === '') {
+ return Boolean(panelUrlNormalized && String(panelUrlNormalized).trim() !== '');
+ }
+ return envTruthy('MANAGED_AGENT_POLL_ENABLED', 'RELEASEPANEL_POLL_ENABLED');
 }
 
 const host = envPair('MANAGED_AGENT_RUNNER_HOST', 'RELEASEPANEL_RUNNER_HOST', '127.0.0.1');
@@ -126,10 +135,10 @@ const provisionTimeoutMs = Number.parseInt(
 );
 const panelUrl = envPair('MANAGED_AGENT_PANEL_URL', 'RELEASEPANEL_PANEL_URL', '').replace(/\/+$/, '');
 const heartbeatIntervalMs = Number.parseInt(
-    envPair('MANAGED_AGENT_RUNNER_HEARTBEAT_MS', 'RELEASEPANEL_RUNNER_HEARTBEAT_MS', '30000'),
-    10,
+ envPair('MANAGED_AGENT_RUNNER_HEARTBEAT_MS', 'RELEASEPANEL_RUNNER_HEARTBEAT_MS', '30000'),
+ 10,
 );
-const pollEnabled = envTruthy('MANAGED_AGENT_POLL_ENABLED', 'RELEASEPANEL_POLL_ENABLED');
+const pollEnabled = envPollEnabled(panelUrl);
 const pollIntervalMs = Math.max(
     3000,
     Number.parseInt(envPair('MANAGED_AGENT_POLL_INTERVAL_SECONDS', 'RELEASEPANEL_POLL_INTERVAL_SECONDS', '5'), 10) * 1000,

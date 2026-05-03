@@ -116,6 +116,23 @@ upsert_env RELEASEPANEL_RUNNER_HEARTBEAT_MS "30000"
 upsert_env MANAGED_AGENT_SERVER_NAME "${server_name}"
 upsert_env RELEASEPANEL_SERVER_NAME "${server_name}"
 
+# Default outbound poll on: Prepare server, deploy, site create, SSL use POST /api/agent/poll.
+# Opt out: MANAGED_AGENT_POLL_ENABLED=false before registration.
+poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
+if [ -z "${poll_raw}" ]; then
+    poll_raw=true
+fi
+case "${poll_raw}" in
+    0 | false | FALSE | no | NO | off | OFF)
+        upsert_env MANAGED_AGENT_POLL_ENABLED "false"
+        upsert_env RELEASEPANEL_POLL_ENABLED "false"
+        ;;
+    *)
+        upsert_env MANAGED_AGENT_POLL_ENABLED "true"
+        upsert_env RELEASEPANEL_POLL_ENABLED "true"
+        ;;
+esac
+
 case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
     1 | true | TRUE | yes | YES | on | ON)
         upsert_env MANAGED_AGENT_PANEL_INSECURE_TLS "1"

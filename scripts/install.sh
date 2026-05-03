@@ -268,6 +268,20 @@ connectivity_hint() {
     fi
 }
 
+ensure_default_agent_poll_env() {
+    local f="$1"
+    [ -f "${f}" ] || return 0
+    if grep -qE '^MANAGED_AGENT_POLL_ENABLED=' "${f}" || grep -qE '^RELEASEPANEL_POLL_ENABLED=' "${f}"; then
+        return 0
+    fi
+    {
+        printf '\n# Outbound job poll (on by default — panel delivers Prepare / deploy / site / SSL work here)\n'
+        printf 'MANAGED_AGENT_POLL_ENABLED=true\n'
+        printf 'RELEASEPANEL_POLL_ENABLED=true\n'
+    } >> "${f}"
+    chmod 600 "${f}"
+}
+
 main() {
     parse_args "$@"
 
@@ -344,6 +358,8 @@ main() {
         bash "${TOOLKIT}/scripts/join-panel.sh" "${PANEL_URL}"
         secure_install_root_permissions
     fi
+
+    ensure_default_agent_poll_env "${INSTALL_ROOT}/.env"
 
     if [ -f "${INSTALL_ROOT}/.env" ]; then
         log "Runner URL: $(effective_runner_public_url)"
