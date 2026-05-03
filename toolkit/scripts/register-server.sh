@@ -3,11 +3,14 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-if [ -f "${TOOLKIT_DIR}/../server.js" ]; then
-    RUNNER_ENV="$(cd "${TOOLKIT_DIR}/.." && pwd)/.env"
-else
-    RUNNER_ENV="${TOOLKIT_DIR}/runner/.env"
-fi
+RUNNER_HOME="$(
+    export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT_DIR}"
+    export RELEASEPANEL_RUNNER_DIR="${RELEASEPANEL_RUNNER_DIR:-}"
+    # shellcheck source=../lib/common.sh
+    . "${TOOLKIT_DIR}/lib/common.sh"
+    releasepanel_resolve_runner_directory
+)"
+RUNNER_ENV="${RUNNER_HOME}/.env"
 
 fail() {
     printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2

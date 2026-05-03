@@ -510,15 +510,37 @@ php_binary() {
     fail "PHP ${RELEASEPANEL_PHP_VERSION} CLI missing. Run: releasepanel install-php ${RELEASEPANEL_PHP_VERSION}"
 }
 
-# Directory containing server.js (classic: toolkit/runner, bundle: repo root with toolkit/ sibling).
+# Directory containing server.js.
+# Prefer explicit RELEASEPANEL_RUNNER_DIR, then /opt/releasepanel-runner (control-plane
+# layout: git clone from releasepanel-runner), then a sibling ../releasepanel-runner
+# checkout (developer machine), then bundle layout (server.js next to toolkit/), finally
+# legacy monorepo toolkit/runner/ (deprecated).
 releasepanel_resolve_runner_directory() {
     local toolkit="${RELEASEPANEL_TOOLKIT_DIR:-/opt/releasepanel-deploy}"
 
+    if [ -n "${RELEASEPANEL_RUNNER_DIR:-}" ] && [ -f "${RELEASEPANEL_RUNNER_DIR}/server.js" ]; then
+        printf '%s\n' "$(cd "${RELEASEPANEL_RUNNER_DIR}" && pwd)"
+        return 0
+    fi
+
+    local opt_public="/opt/releasepanel-runner"
+    if [ -f "${opt_public}/server.js" ]; then
+        printf '%s\n' "${opt_public}"
+        return 0
+    fi
+
+    local sibling="${toolkit}/../releasepanel-runner"
+    if [ -f "${sibling}/server.js" ]; then
+        printf '%s\n' "$(cd "${sibling}" && pwd)"
+        return 0
+    fi
+
     if [ -f "${toolkit}/../server.js" ]; then
         printf '%s\n' "$(cd "${toolkit}/.." && pwd)"
-    else
-        printf '%s\n' "${toolkit}/runner"
+        return 0
     fi
+
+    printf '%s\n' "${toolkit}/runner"
 }
 
 releasepanel_write_managed_agent_systemd_unit() {
@@ -544,7 +566,19 @@ releasepanel_write_managed_agent_systemd_unit() {
         return 1
     fi
 
-    sed -e "s|__RUNNER_DIR__|${runner_dir}|g" -e "s|__NODE_BIN__|${node_bin}|g" "${service_source}" > "${service_target}"
+    # Legacy templates used __RELEASEPANEL_TOOLKIT_DIR__/runner; current use __RUNNER_DIR__ + __NODE_BIN__.
+    # Order: longer / more specific patterns first.
+    sed -e "s|__RELEASEPANEL_TOOLKIT_DIR__/runner|${runner_dir}|g" \
+        -e "s|__RELEASEPANEL_TOOLKIT_DIR__|${toolkit_dir}|g" \
+        -e "s|__RUNNER_DIR__|${runner_dir}|g" \
+        -e "s|__NODE_BIN__|${node_bin}|g" \
+        "${service_source}" > "${service_target}"
+
+    if grep -qE '__[A-Z][A-Z0-9_]*__' "${service_target}"; then
+        warn "releasepanel_write_managed_agent_systemd_unit: unreplaced placeholders in ${service_target} — check ${service_source}"
+        return 1
+    fi
+
     log "Systemd unit: ${service_target}"
 }
 
@@ -761,7 +795,6 @@ PY
 # Laravel heal (sync-self-site) updates the DB but never rewrote runner/.env — drift causes 401 Unauthorized.
 releasepanel_align_host_runner_dotenv_with_shared_env() {
     local shared_env="${RELEASEPANEL_SHARED}/.env"
-    local toolkit="${RELEASEPANEL_TOOLKIT_DIR}"
     local runner_dir=""
     local runner_env=""
     local panel_key=""
@@ -778,11 +811,7 @@ releasepanel_align_host_runner_dotenv_with_shared_env() {
         return 0
     fi
 
-    if [ -f "${toolkit}/../server.js" ]; then
-        runner_dir="$(cd "${toolkit}/.." && pwd)"
-    else
-        runner_dir="${toolkit}/runner"
-    fi
+    runner_dir="$(releasepanel_resolve_runner_directory)"
 
     runner_env="${runner_dir}/.env"
     if [ ! -f "${runner_env}" ]; then
