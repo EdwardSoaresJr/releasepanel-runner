@@ -17,6 +17,8 @@ Default clone directory: **`/opt/managed-deploy-agent`**. Override clone target 
 
 The control plane calls the agent with header **`X-Managed-Agent-Key`** (legacy **`X-RELEASEPANEL-KEY`** is still accepted). Configure the shared secret as **`MANAGED_AGENT_RUNNER_KEY`** (or legacy **`RELEASEPANEL_RUNNER_KEY`**) in `.env`.
 
+**`GET /health`** includes **`version`** / **`agent_version`** (release tag from **`MANAGED_AGENT_RUNNER_VERSION`** if set, otherwise short **git** revision) and **`git_revision`** when running from a git checkout — the panel surfaces these on server discovery / test runner.
+
 ## Quick install (customer VPS)
 
 From the control plane UI, copy the **bootstrap** command, or:

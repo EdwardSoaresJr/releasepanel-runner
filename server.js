@@ -32,6 +32,48 @@ function loadRunnerDotenv() {
 
 const dotenvResult = loadRunnerDotenv();
 
+/**
+ * Best-effort short git revision when running from a git checkout (no network).
+ */
+function readGitRevisionShort() {
+    try {
+        const gitDir = path.join(__dirname, '.git');
+        const headPath = path.join(gitDir, 'HEAD');
+        if (!fs.existsSync(headPath)) {
+            return null;
+        }
+        let head = fs.readFileSync(headPath, 'utf8').trim();
+        if (head.startsWith('ref:')) {
+            const ref = head.replace(/^ref:\s*/i, '').trim();
+            const refFile = path.join(gitDir, ref);
+            if (fs.existsSync(refFile)) {
+                head = fs.readFileSync(refFile, 'utf8').trim();
+            } else {
+                const packed = path.join(gitDir, 'packed-refs');
+                if (fs.existsSync(packed)) {
+                    const lines = fs.readFileSync(packed, 'utf8').split(/\r?\n/);
+                    for (const line of lines) {
+                        if (line.startsWith('#') || line === '') {
+                            continue;
+                        }
+                        const m = line.match(/^([0-9a-f]+) (.+)$/);
+                        if (m && m[2] === ref) {
+                            head = m[1];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (/^[0-9a-f]{7,40}$/i.test(head)) {
+            return head.length > 7 ? head.slice(0, 7) : head;
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const os = require('os');
@@ -48,6 +90,14 @@ function envPair(primary, legacy, defaultValue = '') {
         return v;
     }
     return defaultValue;
+}
+
+function resolvedRunnerVersionLabel() {
+    const envRaw = envPair('MANAGED_AGENT_RUNNER_VERSION', 'RELEASEPANEL_RUNNER_VERSION', '');
+    if (envRaw && envRaw.trim() !== '') {
+        return envRaw.trim();
+    }
+    return readGitRevisionShort() || 'local';
 }
 
 function envTruthy(primary, legacy) {
@@ -285,11 +335,15 @@ function installedPhpVersions() {
 
 function healthContract() {
     const publicIp = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '');
+    const gitRevision = readGitRevisionShort();
+    const version = resolvedRunnerVersionLabel();
 
     return {
         status: 'ok',
         runner: 'managed-deploy-agent',
-        version: envPair('MANAGED_AGENT_RUNNER_VERSION', 'RELEASEPANEL_RUNNER_VERSION', 'local'),
+        version,
+        agent_version: version,
+        git_revision: gitRevision,
         hostname: os.hostname(),
         public_ip: publicIp ? publicIp : null,
         time: new Date().toISOString(),
@@ -2797,7 +2851,7 @@ async function runAgentPollCycle() {
         const res = await panelFetchJson('/api/agent/poll', {
             method: 'POST',
             bodyObj: {
-                agent_version: envPair('MANAGED_AGENT_RUNNER_VERSION', 'RELEASEPANEL_RUNNER_VERSION', 'local'),
+                agent_version: resolvedRunnerVersionLabel(),
                 capabilities: ['deploy', 'provision', 'site_create', 'ssl_enable', 'promote'],
             },
         });
