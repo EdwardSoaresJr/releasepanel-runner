@@ -4,6 +4,17 @@
 set -Eeuo pipefail
 
 TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "${TOOLKIT_DIR}/lib/common.sh"
+if [ -f "${TOOLKIT_DIR}/deploy.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${TOOLKIT_DIR}/deploy.env"
+    set +a
+fi
+: "${RELEASEPANEL_PHP_VERSION:=${PHP_VERSION:-8.3}}"
+PHP_CLI="$(php_binary)"
+
 BASE_PATH="/var/www/sites/releasepanel-app/production"
 
 echo "=== redis-cli ping ==="
@@ -42,7 +53,7 @@ fi
 
 echo ""
 echo "=== Laravel cache store probe ==="
-sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && php artisan tinker --execute=\"
+sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && $(printf '%q' "${PHP_CLI}") artisan tinker --execute=\"
     try {
         Cache::store(config('cache.default'))->put('_rp_health', '1', 5);
         echo config('cache.default').': ok'.PHP_EOL;

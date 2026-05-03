@@ -5,12 +5,22 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=__RELEASEPANEL_TOOLKIT_DIR__/runner
+WorkingDirectory=__RUNNER_DIR__
+# __RUNNER_DIR__ is an absolute path (installer passes INSTALL_ROOT).
 Environment=NODE_ENV=production
+# Ensure node/npm from /usr/local or distro paths are visible to the service and child processes.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=__NODE_BIN__ server.js
+# Listen address/port normally come from runner/.env (MANAGED_AGENT_RUNNER_HOST must be 127.0.0.1 or 0.0.0.0).
+# Uncomment only if you must override .env (systemd env wins over dotenv for unset keys in some setups — prefer editing .env).
+# Environment=MANAGED_AGENT_RUNNER_HOST=127.0.0.1
+# Environment=MANAGED_AGENT_RUNNER_PORT=9000
+ExecStart=__NODE_BIN__ __RUNNER_DIR__/server.js
 Restart=always
 RestartSec=5
+
+# Minimal hardening: PrivateTmp isolates /tmp. Avoid stronger systemd sandbox options —
+# this service runs Node, spawns bash/toolkit commands, and uses sudo -Hu (see ARK deploy agent).
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

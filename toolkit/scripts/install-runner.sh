@@ -3,23 +3,10 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-# Classic layout: <toolkit>/runner/ (private deploy checkout). Public bundle: <repo>/toolkit + <repo>/server.js.
-if [ -f "${TOOLKIT_DIR}/../server.js" ]; then
-    RUNNER_DIR="$(cd "${TOOLKIT_DIR}/.." && pwd)"
-else
-    RUNNER_DIR="${TOOLKIT_DIR}/runner"
-fi
-SERVICE_SOURCE="${TOOLKIT_DIR}/systemd/managed-deploy-agent.service.example"
-SERVICE_TARGET="/etc/systemd/system/managed-deploy-agent.service"
+export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT_DIR}"
 
-log() {
-    printf '\033[1;34m[deploy-toolkit]\033[0m %s\n' "$*"
-}
-
-fail() {
-    printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2
-    exit 1
-}
+# shellcheck source=../lib/common.sh
+. "${TOOLKIT_DIR}/lib/common.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
     fail "Run this script as root."
@@ -28,10 +15,12 @@ fi
 command -v node >/dev/null 2>&1 || fail "node is not installed."
 command -v npm >/dev/null 2>&1 || fail "npm is not installed."
 
+RUNNER_DIR="$(releasepanel_resolve_runner_directory)"
+
 cd "${RUNNER_DIR}"
 
-log "Installing agent dependencies."
-npm install --omit=dev
+log "Installing agent dependencies (${RUNNER_DIR})."
+releasepanel_managed_agent_install_node_modules "${RUNNER_DIR}" || fail "npm install failed."
 
 if [ ! -f "${RUNNER_DIR}/.env" ]; then
     log "Creating .env from .env.example."
@@ -88,14 +77,7 @@ PY
 chmod 600 "${RUNNER_DIR}/.env"
 
 log "Installing systemd service."
-if [ -f "${RUNNER_DIR}/systemd/managed-deploy-agent.service" ]; then
-    sed -e "s#__RUNNER_DIR__#${RUNNER_DIR}#g" "${RUNNER_DIR}/systemd/managed-deploy-agent.service" > "${SERVICE_TARGET}"
-else
-    sed \
-        -e "s#__RELEASEPANEL_TOOLKIT_DIR__#${TOOLKIT_DIR}#g" \
-        -e "s#/opt/releasepanel-deploy#${TOOLKIT_DIR}#g" \
-        "${SERVICE_SOURCE}" > "${SERVICE_TARGET}"
-fi
+releasepanel_write_managed_agent_systemd_unit "${RUNNER_DIR}" "${TOOLKIT_DIR}" || fail "Could not write systemd unit."
 
 systemctl daemon-reload
 systemctl enable managed-deploy-agent
@@ -120,6 +102,13 @@ if [ "${runner_key_ok}" -eq 0 ]; then
 fi
 
 systemctl restart managed-deploy-agent
+
+log "Verifying managed deploy agent /health (matching panel RELEASEPANEL_RUNNER_KEY)..."
+if ! releasepanel_runner_probe_health "${RUNNER_DIR}" 90; then
+    systemctl status managed-deploy-agent --no-pager || true
+    journalctl -u managed-deploy-agent -n 80 --no-pager || true
+    fail "Managed deploy agent did not become healthy. Fix errors above, then: sudo releasepanel runner"
+fi
 
 echo ""
 echo "[deploy-toolkit] Agent installed."

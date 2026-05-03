@@ -13,7 +13,8 @@ shift
 load_env
 require_env_value RELEASEPANEL_SERVER_NAME
 if [ -z "${RELEASEPANEL_SSL_EMAIL:-}" ]; then
-    fail "RELEASEPANEL_SSL_EMAIL is not set. Add it to the toolkit site env (file: ${RELEASEPANEL_DEPLOY_ENV:-deploy.env}) — required for Certbot --email."
+    deploy_env="${RELEASEPANEL_DEPLOY_ENV:-deploy.env}"
+    fail "RELEASEPANEL_SSL_EMAIL is not set (Certbot requires a contact email). Edit ${deploy_env} and add: RELEASEPANEL_SSL_EMAIL=you@example.com — then re-run SSL finalization (e.g. releasepanel site ssl <site> <env>)."
 fi
 
 server_ip="$(current_public_ip)"
@@ -43,10 +44,46 @@ for extra_domain in ${RELEASEPANEL_CERTBOT_EXTRA_DOMAINS}; do
     certbot_domains+=(-d "${extra_domain}")
 done
 
+for alias in ${RELEASEPANEL_SERVER_ALIASES:-}; do
+    [ -z "${alias}" ] && continue
+    if [ "${alias}" = "${RELEASEPANEL_SERVER_NAME}" ]; then
+        continue
+    fi
+    certbot_domains+=(-d "${alias}")
+done
+
 nginx -t
 
-if [ -f "${cert}" ]; then
-    log "Certificate already exists at ${cert}; skipping issuance."
+skip_certbot=false
+if [ -f "${cert}" ] && command -v openssl >/dev/null 2>&1; then
+    issuer="$(openssl x509 -in "${cert}" -noout -issuer 2>/dev/null || echo '')"
+    if grep -qi "Let's Encrypt" <<<"${issuer}"; then
+        case "${RELEASEPANEL_CERTBOT_FORCE_REISSUE:-false}" in
+            1 | true | TRUE | yes | YES)
+                log "RELEASEPANEL_CERTBOT_FORCE_REISSUE=true; running Certbot despite existing certificate."
+                ;;
+            *)
+                skip_certbot=true
+                ;;
+        esac
+    else
+        warn "File exists at ${cert} but it does not appear to be a Let's Encrypt certificate."
+        warn "OpenSSL issuer: ${issuer}"
+        warn "Certbot will run to replace it with a Let's Encrypt certificate."
+    fi
+elif [ -f "${cert}" ]; then
+    warn "openssl not installed; cannot verify ${cert}. Skipping issuance. Install openssl and re-run if the browser still shows the wrong certificate."
+    skip_certbot=true
+fi
+
+if [ "${skip_certbot}" = true ]; then
+    log "Let's Encrypt certificate already present at ${cert}; skipping issuance."
+    if command -v openssl >/dev/null 2>&1; then
+        while IFS= read -r meta_line; do
+            log "  ${meta_line}"
+        done < <(openssl x509 -in "${cert}" -noout -subject -dates 2>/dev/null || true)
+    fi
+    nginx -t
     systemctl reload nginx
     exit 0
 fi
@@ -55,6 +92,7 @@ log "Running Certbot for ${RELEASEPANEL_SERVER_NAME}."
 certbot certonly --webroot \
     -w "${RELEASEPANEL_BASE}/current/public" \
     "${certbot_domains[@]}" \
+    --cert-name "${RELEASEPANEL_SERVER_NAME}" \
     --email "${RELEASEPANEL_SSL_EMAIL}" \
     --agree-tos \
     --no-eff-email

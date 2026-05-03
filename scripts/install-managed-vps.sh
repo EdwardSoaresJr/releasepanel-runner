@@ -1,34 +1,37 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Customer VPS entrypoint: ReleasePanel "Servers" bootstrap pipes `curl … | bash`.
+# Clones the public agent bundle (runner + vendor toolkit/) then runs bootstrap-runner.
+# Canonical copy lives in releasepanel-deploy; publish to releasepanel-runner via
+# scripts/publish-releasepanel-runner.sh.
+#
+# Expected env (see ServerController::runnerInstallCommand):
+#   MANAGED_AGENT_PANEL_URL, MANAGED_AGENT_SERVER_ID, MANAGED_AGENT_RUNNER_KEY
+# Optional:
+#   MANAGED_AGENT_REPO_URL / RELEASEPANEL_RUNNER_REPO_HTTPS — git clone URL
+#   MANAGED_AGENT_REPO_BRANCH / RELEASEPANEL_RUNNER_BRANCH — default main
+#   MANAGED_AGENT_INSTALL_ROOT / MANAGED_AGENT_INSTALL_DIR — default /opt/managed-deploy-agent
+
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
 
-readonly DEPLOY_ROOT="/opt"
-# Canonical public Git URL (must be cloneable without auth). GitHub repo is still
-# named releasepanel-runner until renamed; override with MANAGED_AGENT_RUNNER_REPO_HTTPS when you publish under another name.
-readonly DEFAULT_RUNNER_BUNDLE_HTTPS="https://github.com/EdwardSoaresJr/releasepanel-runner.git"
-readonly RUNNER_REPO_DIR="${MANAGED_AGENT_INSTALL_DIR:-${DEPLOY_ROOT}/managed-deploy-agent}"
-readonly RUNNER_REPO_HTTPS="${MANAGED_AGENT_RUNNER_REPO_HTTPS:-${RELEASEPANEL_RUNNER_REPO_HTTPS:-${DEFAULT_RUNNER_BUNDLE_HTTPS}}}"
-
-log() {
-    printf '%s\n' "[managed-deploy-agent-install] $*"
-}
-
-fail() {
-    printf '%s\n' "[managed-deploy-agent-install] ERROR: $*" >&2
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[install-managed-vps] ERROR: run as root." >&2
     exit 1
-}
+fi
 
-require_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        fail "Run as root, for example: sudo -i"
-    fi
-}
+DEFAULT_REPO="${MANAGED_AGENT_REPO_URL:-${RELEASEPANEL_RUNNER_REPO_HTTPS:-https://github.com/EdwardSoaresJr/releasepanel-runner.git}}"
+DEFAULT_BRANCH="${MANAGED_AGENT_REPO_BRANCH:-${RELEASEPANEL_RUNNER_BRANCH:-main}}"
+INSTALL_ROOT="${MANAGED_AGENT_INSTALL_ROOT:-${MANAGED_AGENT_INSTALL_DIR:-/opt/managed-deploy-agent}}"
+TOOLKIT="${INSTALL_ROOT}/toolkit"
+
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
 
 install_minimal_dependencies() {
-    log "Installing minimal dependencies (git, curl)..."
+    echo "[install-managed-vps] Installing minimal dependencies (git, curl)…"
     apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -y
     apt-get install -y \
         -o Acquire::Retries=3 \
@@ -39,41 +42,52 @@ install_minimal_dependencies() {
         git curl ca-certificates openssh-client
 }
 
-clone_public_runner_bundle() {
-    log "Cloning or updating public agent into ${RUNNER_REPO_DIR}"
-
-    export GIT_TERMINAL_PROMPT=0
-
-    mkdir -p "${DEPLOY_ROOT}"
-
-    if [ -d "${RUNNER_REPO_DIR}/.git" ]; then
-        log "Repository present; pulling --ff-only."
-        git -c credential.helper= -C "${RUNNER_REPO_DIR}" pull --ff-only || fail "git pull failed for ${RUNNER_REPO_DIR}"
-    else
-        if [ -e "${RUNNER_REPO_DIR}" ]; then
-            fail "${RUNNER_REPO_DIR} exists but is not a git repository"
-        fi
-        git -c credential.helper= clone "${RUNNER_REPO_HTTPS}" "${RUNNER_REPO_DIR}" \
-            || fail "HTTPS clone failed. Repository must be public, or set MANAGED_AGENT_RUNNER_REPO_HTTPS to a public mirror."
+install_or_refresh_clone() {
+    if [ -d "${INSTALL_ROOT}/.git" ]; then
+        echo "[install-managed-vps] Existing clone at ${INSTALL_ROOT}; fetching latest ${DEFAULT_BRANCH}…"
+        git -C "${INSTALL_ROOT}" fetch --depth 1 origin "${DEFAULT_BRANCH}" 2>/dev/null || true
+        git -C "${INSTALL_ROOT}" checkout "${DEFAULT_BRANCH}" 2>/dev/null || true
+        git -C "${INSTALL_ROOT}" pull --ff-only origin "${DEFAULT_BRANCH}" 2>/dev/null || {
+            echo "[install-managed-vps] WARN: git pull failed; continuing with on-disk tree." >&2
+        }
+        return 0
     fi
 
-    if [ ! -f "${RUNNER_REPO_DIR}/toolkit/scripts/bootstrap-runner.sh" ]; then
-        fail "Checkout missing toolkit/scripts/bootstrap-runner.sh — verify MANAGED_AGENT_RUNNER_REPO_HTTPS points at this agent repository."
+    if [ -e "${INSTALL_ROOT}" ]; then
+        echo "[install-managed-vps] ERROR: ${INSTALL_ROOT} exists but is not a git clone." >&2
+        echo "[install-managed-vps] Move it aside or set MANAGED_AGENT_INSTALL_ROOT / MANAGED_AGENT_INSTALL_DIR to an empty path." >&2
+        exit 1
     fi
+
+    echo "[install-managed-vps] Cloning ${DEFAULT_REPO} (${DEFAULT_BRANCH}) → ${INSTALL_ROOT}…"
+    install -d -m 0755 "$(dirname "${INSTALL_ROOT}")"
+    git clone --depth 1 --branch "${DEFAULT_BRANCH}" "${DEFAULT_REPO}" "${INSTALL_ROOT}"
 }
 
-main() {
-    log "Starting customer VPS install (connects this server to your control plane)."
-    log "This installer expects a fresh Ubuntu server with no existing nginx/apache/caddy/lighttpd stack."
-    log "Override only if you know the risks: MANAGED_AGENT_SKIP_FRESH_SERVER_CHECK=1"
-    require_root
+if command -v apt-get >/dev/null 2>&1; then
     install_minimal_dependencies
-    clone_public_runner_bundle
-    bash "${RUNNER_REPO_DIR}/toolkit/scripts/assert-fresh-managed-server.sh"
-    export RELEASEPANEL_TOOLKIT_DIR="${RUNNER_REPO_DIR}/toolkit"
-    export MANAGED_AGENT_TOOLKIT_DIR="${RUNNER_REPO_DIR}/toolkit"
-    cd "${RUNNER_REPO_DIR}/toolkit"
-    exec bash scripts/bootstrap-runner.sh
-}
+else
+    echo "[install-managed-vps] WARN: apt-get not found; ensure git and curl are installed." >&2
+fi
 
-main "$@"
+install_or_refresh_clone
+
+if [ ! -f "${INSTALL_ROOT}/server.js" ]; then
+    echo "[install-managed-vps] ERROR: ${INSTALL_ROOT}/server.js missing after clone." >&2
+    exit 1
+fi
+
+if [ ! -f "${TOOLKIT}/scripts/bootstrap-runner.sh" ]; then
+    echo "[install-managed-vps] ERROR: toolkit missing at ${TOOLKIT}/scripts/bootstrap-runner.sh." >&2
+    echo "[install-managed-vps] Use the public agent repo that vendors toolkit/ (see releasepanel-runner README)." >&2
+    exit 1
+fi
+
+if [ -f "${TOOLKIT}/scripts/assert-fresh-managed-server.sh" ]; then
+    bash "${TOOLKIT}/scripts/assert-fresh-managed-server.sh"
+fi
+
+export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT}"
+export MANAGED_AGENT_TOOLKIT_DIR="${TOOLKIT}"
+cd "${TOOLKIT}"
+exec bash scripts/bootstrap-runner.sh

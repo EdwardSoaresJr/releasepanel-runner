@@ -49,6 +49,8 @@ for program in default heavy notifications horizon deployments runners maintenan
     rm -f "/etc/supervisor/conf.d/releasepanel-${RELEASEPANEL_ENV}-${program}.conf"
 done
 
+rp_php_cli="$(php_binary)"
+
 for file in "${worker_configs[@]}"; do
     name="$(basename "${file}")"
     env_name="${name/releasepanel-/releasepanel-${RELEASEPANEL_ENV}-}"
@@ -57,6 +59,7 @@ for file in "${worker_configs[@]}"; do
         -e "s#__RELEASEPANEL_PROGRAM_PREFIX__#${RELEASEPANEL_PROGRAM_PREFIX}#g" \
         -e "s#__RELEASEPANEL_BASE__#${RELEASEPANEL_BASE}#g" \
         -e "s#__RELEASEPANEL_APP_USER__#${RELEASEPANEL_APP_USER}#g" \
+        -e "s#__PHP_BINARY__#${rp_php_cli}#g" \
         "${file}" > "/etc/supervisor/conf.d/${env_name}"
 done
 
@@ -84,7 +87,7 @@ restart_workers
 
 log "Installing scheduler cron."
 cat > "/etc/cron.d/releasepanel-${RELEASEPANEL_ENV}-scheduler" <<EOF
-* * * * * ${RELEASEPANEL_APP_USER} cd ${RELEASEPANEL_BASE}/current && php artisan schedule:run >> /dev/null 2>&1
+* * * * * ${RELEASEPANEL_APP_USER} cd ${RELEASEPANEL_BASE}/current && ${rp_php_cli} artisan schedule:run >> /dev/null 2>&1
 EOF
 chmod 644 "/etc/cron.d/releasepanel-${RELEASEPANEL_ENV}-scheduler"
 

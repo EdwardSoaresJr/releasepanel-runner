@@ -1,14 +1,42 @@
 #!/usr/bin/env node
 'use strict';
 
-require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+
+/**
+ * Resolve .env the same way operators deploy: bundle root, classic runner/, or nested toolkit/runner/.
+ */
+function loadRunnerDotenv() {
+    const candidates = [
+        path.join(__dirname, '.env'),
+        path.join(__dirname, 'runner', '.env'),
+        path.join(__dirname, 'toolkit', 'runner', '.env'),
+    ];
+    const triedPaths = [...candidates];
+
+    for (const envPath of candidates) {
+        try {
+            if (fs.existsSync(envPath)) {
+                require('dotenv').config({ path: envPath });
+                return { loadedPath: envPath, triedPaths };
+            }
+        } catch {
+            // ignore unreadable paths
+        }
+    }
+
+    require('dotenv').config();
+    return { loadedPath: null, triedPaths };
+}
+
+const dotenvResult = loadRunnerDotenv();
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const fs = require('fs');
-const path = require('path');
 const os = require('os');
-const { Agent } = require('undici');
+const https = require('https');
+const { URL } = require('url');
 const { spawn, spawnSync } = require('child_process');
 
 const app = express();
@@ -32,7 +60,7 @@ const port = Number.parseInt(envPair('MANAGED_AGENT_RUNNER_PORT', 'RELEASEPANEL_
 const apiKey = envPair('MANAGED_AGENT_RUNNER_KEY', 'RELEASEPANEL_RUNNER_KEY', '');
 const logPath = envPair('MANAGED_AGENT_RUNNER_LOG', 'RELEASEPANEL_RUNNER_LOG', '/var/log/managed-deploy-agent.log');
 const toolkitPath = path.resolve(
-    envPair('MANAGED_AGENT_TOOLKIT_DIR', 'RELEASEPANEL_TOOLKIT_DIR', path.join(__dirname, 'toolkit')),
+    envPair('MANAGED_AGENT_TOOLKIT_DIR', 'RELEASEPANEL_TOOLKIT_DIR', path.join(__dirname, '..')),
 );
 const normalTimeoutMs = Number.parseInt(
     envPair('MANAGED_AGENT_RUNNER_NORMAL_TIMEOUT_MS', 'RELEASEPANEL_RUNNER_NORMAL_TIMEOUT_MS', '120000'),
@@ -42,25 +70,51 @@ const deployTimeoutMs = Number.parseInt(
     envPair('MANAGED_AGENT_RUNNER_DEPLOY_TIMEOUT_MS', 'RELEASEPANEL_RUNNER_DEPLOY_TIMEOUT_MS', '900000'),
     10,
 );
+const provisionTimeoutMs = Number.parseInt(
+    envPair('MANAGED_AGENT_PROVISION_TIMEOUT_MS', 'RELEASEPANEL_PROVISION_TIMEOUT_MS', '900000'),
+    10,
+);
 const panelUrl = envPair('MANAGED_AGENT_PANEL_URL', 'RELEASEPANEL_PANEL_URL', '').replace(/\/+$/, '');
 const heartbeatIntervalMs = Number.parseInt(
     envPair('MANAGED_AGENT_RUNNER_HEARTBEAT_MS', 'RELEASEPANEL_RUNNER_HEARTBEAT_MS', '30000'),
     10,
 );
+const pollEnabled = envTruthy('MANAGED_AGENT_POLL_ENABLED', 'RELEASEPANEL_POLL_ENABLED');
+const pollIntervalMs = Math.max(
+    3000,
+    Number.parseInt(envPair('MANAGED_AGENT_POLL_INTERVAL_SECONDS', 'RELEASEPANEL_POLL_INTERVAL_SECONDS', '5'), 10) * 1000,
+);
 const panelInsecureTls = envTruthy('MANAGED_AGENT_PANEL_INSECURE_TLS', 'RELEASEPANEL_PANEL_INSECURE_TLS');
-let panelHeartbeatDispatcher = null;
-if (panelInsecureTls && panelUrl.startsWith('https:')) {
-    panelHeartbeatDispatcher = new Agent({
-        connect: {
-            rejectUnauthorized: false,
-        },
-    });
-}
 const runningEnvActions = new Map();
 const commandRuns = new Map();
 const maxTailBytes = 256 * 1024;
 const maxRunOutputBytes = 512 * 1024;
+const maxAgentPanelOutputChars = 200000;
 const runTtlMs = 30 * 60 * 1000;
+
+function truncateForAgentPanel(text, maxLen) {
+    const s = String(text || '');
+    if (s.length <= maxLen) {
+        return s;
+    }
+    return `...[truncated]...\n${s.slice(s.length - (maxLen - 22))}`;
+}
+
+function explainProvisionSudoFailure(stdout, stderr) {
+    const blob = `${stderr || ''}\n${stdout || ''}`;
+    const low = blob.toLowerCase();
+    if (
+        low.includes('a password is required')
+        || low.includes('sorry, try again')
+        || (low.includes('sudo:') && low.includes('password'))
+        || low.includes('interactive authentication required')
+        || low.includes('sudo: no tty present')
+        || low.includes('a terminal is required to read the password')
+    ) {
+        return ' sudo requires a password or is not configured for non-interactive use — configure NOPASSWD for the agent user or use SSH provisioning.';
+    }
+    return '';
+}
 
 const actionAliases = {};
 
@@ -147,8 +201,15 @@ const promoteAction = {
     locked: true,
 };
 
+if (dotenvResult.loadedPath) {
+    console.error(`[managed-deploy-agent] loaded env file: ${dotenvResult.loadedPath}`);
+} else {
+    console.error(`[managed-deploy-agent] no .env found; checked: ${dotenvResult.triedPaths.join(', ')}`);
+}
+
 if (!apiKey || apiKey === 'CHANGE_ME') {
-    console.error('MANAGED_AGENT_RUNNER_KEY (or legacy RELEASEPANEL_RUNNER_KEY) must be set in .env before starting the agent.');
+    console.error('MANAGED_AGENT_RUNNER_KEY (or legacy RELEASEPANEL_RUNNER_KEY) must be set to the same value as RELEASEPANEL_RUNNER_KEY in the panel shared/.env.');
+    console.error('Repair: sudo releasepanel heal-self-runner   or copy the key into the runner .env then: sudo systemctl restart managed-deploy-agent');
     process.exit(1);
 }
 
@@ -164,9 +225,10 @@ if (panelInsecureTls && panelUrl) {
 app.disable('x-powered-by');
 app.use(rateLimit({
     windowMs: 60 * 1000,
-    max: 30,
+    max: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (request) => request.path === '/health' || request.path === '/api/health',
 }));
 app.use(express.json({ limit: '256kb' }));
 
@@ -181,6 +243,16 @@ function appendLog(entry) {
 
 function requesterIp(request) {
     return request.ip || request.socket?.remoteAddress || 'unknown';
+}
+
+function runnerCorrelationId(request) {
+    const raw = request.get('X-Runner-Correlation-Id');
+    if (raw == null || typeof raw !== 'string') {
+        return null;
+    }
+    const trimmed = raw.trim();
+
+    return trimmed !== '' ? trimmed : null;
 }
 
 function commandAvailable(command) {
@@ -212,11 +284,14 @@ function installedPhpVersions() {
 }
 
 function healthContract() {
+    const publicIp = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '');
+
     return {
         status: 'ok',
         runner: 'managed-deploy-agent',
         version: envPair('MANAGED_AGENT_RUNNER_VERSION', 'RELEASEPANEL_RUNNER_VERSION', 'local'),
         hostname: os.hostname(),
+        public_ip: publicIp ? publicIp : null,
         time: new Date().toISOString(),
         php_versions: installedPhpVersions(),
         nginx: commandAvailable('nginx') && serviceActive('nginx'),
@@ -225,12 +300,128 @@ function healthContract() {
     };
 }
 
+function postHeartbeatRequest(targetUrl, init) {
+    if (!(panelInsecureTls && targetUrl.startsWith('https:'))) {
+        return fetch(targetUrl, init);
+    }
+
+    const u = new URL(targetUrl);
+    const body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body ?? '');
+    const headers = {
+        ...init.headers,
+        'Content-Length': Buffer.byteLength(body),
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(
+            {
+                hostname: u.hostname,
+                port: u.port || 443,
+                path: `${u.pathname}${u.search}`,
+                method: init.method || 'POST',
+                headers,
+                rejectUnauthorized: false,
+            },
+            (res) => {
+                res.resume();
+                res.on('end', () => {
+                    resolve({
+                        ok: res.statusCode >= 200 && res.statusCode < 300,
+                        status: res.statusCode,
+                    });
+                });
+            },
+        );
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+async function panelFetchJson(pathname, { method = 'POST', bodyObj = {} } = {}) {
+    const targetUrl = `${panelUrl}${pathname}`;
+    const bodyStr = JSON.stringify(bodyObj ?? {});
+    const initHeaders = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-RUNNER-KEY': apiKey,
+    };
+
+    if (!(panelInsecureTls && targetUrl.startsWith('https:'))) {
+        const res = await fetch(targetUrl, { method, headers: initHeaders, body: bodyStr });
+        const text = await res.text();
+        let json = {};
+        try {
+            json = text ? JSON.parse(text) : {};
+        } catch {
+            json = { _parse_error: true };
+        }
+
+        return { ok: res.ok, status: res.status, json };
+    }
+
+    const u = new URL(targetUrl);
+    const headers = { ...initHeaders, 'Content-Length': Buffer.byteLength(bodyStr) };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(
+            {
+                hostname: u.hostname,
+                port: u.port || 443,
+                path: `${u.pathname}${u.search}`,
+                method,
+                headers,
+                rejectUnauthorized: false,
+            },
+            (res) => {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => {
+                    const text = Buffer.concat(chunks).toString('utf8');
+                    let json = {};
+                    try {
+                        json = text ? JSON.parse(text) : {};
+                    } catch {
+                        json = { _parse_error: true };
+                    }
+                    resolve({
+                        ok: res.statusCode >= 200 && res.statusCode < 300,
+                        status: res.statusCode || 0,
+                        json,
+                    });
+                });
+            },
+        );
+        req.on('error', reject);
+        req.write(bodyStr);
+        req.end();
+    });
+}
+
 async function sendHeartbeat() {
     if (!panelUrl || !apiKey) {
         return;
     }
 
     try {
+        const heartbeatPayload = {
+            public_ip: envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', null) || null,
+            hostname: os.hostname(),
+        };
+
+        const explicitPublicUrl = envPair('MANAGED_AGENT_RUNNER_PUBLIC_URL', 'RELEASEPANEL_RUNNER_PUBLIC_URL', '').trim();
+        const pip = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '').trim();
+        if (explicitPublicUrl !== '') {
+            heartbeatPayload.runner_url = explicitPublicUrl;
+        } else if (host !== '127.0.0.1' && pip !== '') {
+            heartbeatPayload.runner_url = `http://${pip}:${port}`;
+        }
+
+        const displayName = envPair('MANAGED_AGENT_SERVER_NAME', 'RELEASEPANEL_SERVER_NAME', '');
+        if (displayName) {
+            heartbeatPayload.name = displayName;
+        }
+
         const fetchInit = {
             method: 'POST',
             headers: {
@@ -238,18 +429,9 @@ async function sendHeartbeat() {
                 'Content-Type': 'application/json',
                 'X-RUNNER-KEY': apiKey,
             },
-            body: JSON.stringify({
-                runner_url:
-                    envPair('MANAGED_AGENT_RUNNER_PUBLIC_URL', 'RELEASEPANEL_RUNNER_PUBLIC_URL', '') ||
-                    `http://${host}:${port}`,
-                public_ip: envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', null) || null,
-                hostname: os.hostname(),
-            }),
+            body: JSON.stringify(heartbeatPayload),
         };
-        if (panelHeartbeatDispatcher) {
-            fetchInit.dispatcher = panelHeartbeatDispatcher;
-        }
-        const response = await fetch(`${panelUrl}/api/runner-heartbeat`, fetchInit);
+        const response = await postHeartbeatRequest(`${panelUrl}/api/runner-heartbeat`, fetchInit);
 
         appendLog({
             event: 'heartbeat',
@@ -366,8 +548,73 @@ function envBackupPath(env) {
     return `${environmentBasePath(env)}/shared/.env.backups/.env.${stamp}`;
 }
 
+function resolveSiteToolkitEnvPath(envKey) {
+    if (!toolkitPath || !fs.existsSync(toolkitPath)) {
+        return null;
+    }
+
+    if (envKey.includes('/') && envKey.split('/').filter(Boolean).length === 2) {
+        const [site, envSlug] = envKey.split('/', 2);
+        if (isSafeSlug(site) && isSafeSlug(envSlug)) {
+            const candidate = path.join(toolkitPath, 'sites', site, `${envSlug}.env`);
+
+            return fs.existsSync(candidate) ? candidate : null;
+        }
+
+        return null;
+    }
+
+    const sitesRoot = path.join(toolkitPath, 'sites');
+    if (!fs.existsSync(sitesRoot)) {
+        return null;
+    }
+
+    const siteDirs = fs.readdirSync(sitesRoot, { withFileTypes: true }).filter((d) => d.isDirectory());
+    for (const dirent of siteDirs) {
+        const siteSlug = dirent.name;
+        if (!isSafeSlug(siteSlug)) {
+            continue;
+        }
+
+        const dir = path.join(sitesRoot, siteSlug);
+        let files = [];
+        try {
+            files = fs.readdirSync(dir);
+        } catch {
+            continue;
+        }
+
+        for (const file of files) {
+            if (!file.endsWith('.env')) {
+                continue;
+            }
+
+            const envSlug = file.slice(0, -'.env'.length);
+            if (!isSafeSlug(envSlug)) {
+                continue;
+            }
+
+            if (`${siteSlug}-${envSlug}` === envKey) {
+                return path.join(dir, file);
+            }
+        }
+    }
+
+    return null;
+}
+
 function deployConfigPath(env) {
-    return path.join(toolkitPath, `deploy.${env}.env`);
+    const legacyPath = path.join(toolkitPath, `deploy.${env}.env`);
+    if (fs.existsSync(legacyPath)) {
+        return legacyPath;
+    }
+
+    const resolved = resolveSiteToolkitEnvPath(env);
+    if (resolved) {
+        return resolved;
+    }
+
+    return legacyPath;
 }
 
 function siteConfigPath(site, env) {
@@ -429,8 +676,9 @@ function siteCommandArgs(actionName, site, env) {
 
 function deployConfigBackupPath(env) {
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, 'Z');
+    const programKey = deployProgramKey(env);
 
-    return path.join(toolkitPath, '.deploy-env.backups', `deploy.${env}.env.${stamp}`);
+    return path.join(toolkitPath, '.deploy-env.backups', `deploy.${programKey}.env.${stamp}`);
 }
 
 function environmentBasePath(env) {
@@ -438,10 +686,12 @@ function environmentBasePath(env) {
 }
 
 function fixedLogTargets(env) {
+    const programKey = deployProgramKey(env);
+
     return {
-        deploy: `/var/log/releasepanel-${env}-deploy.log`,
-        nginx_error: `/var/log/nginx/releasepanel-${env}-error.log`,
-        nginx_access: `/var/log/nginx/releasepanel-${env}-access.log`,
+        deploy: `/var/log/releasepanel-${programKey}-deploy.log`,
+        nginx_error: `/var/log/nginx/releasepanel-${programKey}-error.log`,
+        nginx_access: `/var/log/nginx/releasepanel-${programKey}-access.log`,
         laravel: `${environmentBasePath(env)}/shared/storage/logs/laravel.log`,
         worker_default: `${environmentBasePath(env)}/shared/storage/logs/worker-default.log`,
         worker_heavy: `${environmentBasePath(env)}/shared/storage/logs/worker-heavy.log`,
@@ -452,7 +702,9 @@ function fixedLogTargets(env) {
 }
 
 function cronPath(env) {
-    return `/etc/cron.d/releasepanel-${env}-scheduler`;
+    const programKey = deployProgramKey(env);
+
+    return `/etc/cron.d/releasepanel-${programKey}-scheduler`;
 }
 
 function parseEnvFile(filePath) {
@@ -479,12 +731,14 @@ function parseEnvFile(filePath) {
 function normalizeDeployConfig(config) {
     const siteSlug = config.SITE_SLUG || config.RELEASEPANEL_SITE_SLUG || 'site';
     const envSlug = config.ENV_SLUG || config.RELEASEPANEL_ENV_SLUG || 'env';
+    const releasepanelEnv = config.RELEASEPANEL_ENV || `${siteSlug}-${envSlug}`;
 
     return {
         ...config,
         RELEASEPANEL_SITE_SLUG: siteSlug,
         RELEASEPANEL_ENV_SLUG: envSlug,
-        RELEASEPANEL_ENV: config.RELEASEPANEL_ENV || `${siteSlug}-${envSlug}`,
+        RELEASEPANEL_ENV: releasepanelEnv,
+        RELEASEPANEL_NGINX_SITE_BASENAME: config.RELEASEPANEL_NGINX_SITE_BASENAME || releasepanelEnv,
         RELEASEPANEL_APP_USER: config.RELEASEPANEL_APP_USER || config.APP_USER || 'laravel',
         RELEASEPANEL_FILE_GROUP: config.RELEASEPANEL_FILE_GROUP || config.FILE_GROUP || 'www-data',
         RELEASEPANEL_REPO: config.RELEASEPANEL_REPO || config.REPO_URL || '',
@@ -499,6 +753,12 @@ function normalizeDeployConfig(config) {
 
 function deployConfig(env) {
     return normalizeDeployConfig(parseEnvFile(deployConfigPath(env)));
+}
+
+function deployProgramKey(env) {
+    const cfg = deployConfig(env);
+
+    return cfg.RELEASEPANEL_ENV || String(env).replace(/\//g, '-');
 }
 
 function runCurrentArtisan(env, args, timeoutMs = 15000) {
@@ -559,11 +819,11 @@ function certificateSummary(env) {
     const config = deployConfig(env);
     const serverName = config.RELEASEPANEL_SERVER_NAME || '';
     const serverAliases = (config.RELEASEPANEL_SERVER_ALIASES || '').split(/\s+/).filter(Boolean);
-    const siteName = `releasepanel-${env}`;
-    const finalEnabledPath = `/etc/nginx/sites-enabled/${siteName}-https.conf`;
-    const acmeEnabledPath = `/etc/nginx/sites-enabled/${siteName}-acme.conf`;
-    const finalEnabled = fs.existsSync(finalEnabledPath);
-    const acmeEnabled = fs.existsSync(acmeEnabledPath);
+    const nginxBasename = config.RELEASEPANEL_NGINX_SITE_BASENAME || config.RELEASEPANEL_ENV || '';
+    const finalEnabledPath = nginxBasename ? `/etc/nginx/sites-enabled/${nginxBasename}-https.conf` : '';
+    const acmeEnabledPath = nginxBasename ? `/etc/nginx/sites-enabled/${nginxBasename}-acme.conf` : '';
+    const finalEnabled = Boolean(nginxBasename && fs.existsSync(finalEnabledPath));
+    const acmeEnabled = Boolean(nginxBasename && fs.existsSync(acmeEnabledPath));
 
     if (serverName === '') {
         return {
@@ -574,14 +834,8 @@ function certificateSummary(env) {
     }
 
     const certPathLe = `/etc/letsencrypt/live/${serverName}/fullchain.pem`;
-    const certPathSelf = `/etc/ssl/releasepanel/${serverName}/fullchain.pem`;
     let certPath = certPathLe;
     let certExists = fs.existsSync(certPathLe);
-
-    if (!certExists && fs.existsSync(certPathSelf)) {
-        certPath = certPathSelf;
-        certExists = true;
-    }
 
     let sslState = 'missing';
 
@@ -602,7 +856,6 @@ function certificateSummary(env) {
             server_name: serverName,
             server_aliases: serverAliases,
             path: certPathLe,
-            self_signed_path: certPathSelf,
             nginx: {
                 final_enabled: finalEnabled,
                 final_enabled_path: finalEnabledPath,
@@ -751,7 +1004,7 @@ function workersSummary(env) {
         };
     }
 
-    const prefix = `releasepanel-${env}-`;
+    const prefix = `releasepanel-${deployProgramKey(env)}-`;
     const programs = (result.stdout || '')
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -997,7 +1250,7 @@ function writeSharedEnv(request, response) {
     }
 
     try {
-        fs.mkdirSync(`/var/www/sites/${env}/shared/.env.backups`, { recursive: true });
+        fs.mkdirSync(path.join(environmentBasePath(env), 'shared', '.env.backups'), { recursive: true });
 
         const stat = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
         const backupPath = envBackupPath(env);
@@ -1292,13 +1545,14 @@ function readOpsLog(request, response) {
 function readOpsBackups(request, response) {
     const env = request.params.env;
     const targets = backupDirectoryTargets(env);
+    const programKey = deployProgramKey(env);
 
     response.json({
         success: true,
         environment: env,
         backups: {
             shared_env: listDirectoryFiles(targets.shared_env),
-            deploy_config: listDirectoryFiles(targets.deploy_config, `deploy.${env}.env.`),
+            deploy_config: listDirectoryFiles(targets.deploy_config, `deploy.${programKey}.env.`),
         },
     });
 }
@@ -1841,14 +2095,21 @@ function runSiteAction(actionName, definition, request, response) {
 app.use(requireApiKey);
 
 app.get('/health', (request, response) => {
+    const healthIp = requesterIp(request);
+    const correlationId = runnerCorrelationId(request);
     appendLog({
         method: request.method,
         path: request.path,
         action: 'health',
-        requester_ip: requesterIp(request),
+        requester_ip: healthIp,
+        runner_correlation_id: correlationId,
         success: true,
         duration_ms: 0,
     });
+    if (envTruthy('MANAGED_AGENT_LOG_HEALTH_IP', 'RELEASEPANEL_LOG_HEALTH_IP')) {
+        const cidSuffix = correlationId ? ` correlation_id=${correlationId}` : '';
+        console.error(`[managed-deploy-agent] /health requester_ip=${healthIp}${cidSuffix}`);
+    }
 
     response.json({
         ...healthContract(),
@@ -1903,7 +2164,674 @@ app.post('/promote/:site/:fromEnv/:toEnv', validatePromote, (request, response) 
     startPromoteRun(request, response);
 });
 
-app.listen(port, host, () => {
+app.get('/ops/:site/:env/status', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    readOpsStatus(request, response);
+});
+
+app.get('/ops/:site/:env/logs/:log', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    readOpsLog(request, response);
+});
+
+app.get('/ops/:site/:env/backups', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    readOpsBackups(request, response);
+});
+
+app.get('/env/:site/:env', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    readSharedEnv(request, response);
+});
+
+app.put('/env/:site/:env', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    writeSharedEnv(request, response);
+});
+
+app.get('/env/:envKey', requireApiKey, readSharedEnv);
+app.put('/env/:envKey', requireApiKey, writeSharedEnv);
+
+app.get('/deploy-config/:site/:env', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    readDeployConfig(request, response);
+});
+
+app.put('/deploy-config/:site/:env', requireApiKey, (request, response) => {
+    request.params.env = `${request.params.site}/${request.params.env}`;
+    writeDeployConfig(request, response);
+});
+
+app.get('/deploy-config/:envKey', requireApiKey, readDeployConfig);
+app.put('/deploy-config/:envKey', requireApiKey, writeDeployConfig);
+
+function panelDeployKeyDir() {
+    const preferred = '/run/releasepanel';
+    try {
+        fs.mkdirSync(preferred, { mode: 0o700, recursive: true });
+        fs.chmodSync(preferred, 0o700);
+        return preferred;
+    } catch (_) {
+        const uid = typeof process.getuid === 'function' ? process.getuid() : '0';
+        const fallback = path.join(os.tmpdir(), `rp-agent-keys-${uid}`);
+        fs.mkdirSync(fallback, { mode: 0o700, recursive: true });
+        return fallback;
+    }
+}
+
+function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB64 = null, extraCleanupPaths = null) {
+    const definition = siteActions.deploy;
+    const lockKey = `${site}/${env}:deploy`;
+
+    return new Promise((resolve) => {
+        if (definition.locked && runningEnvActions.has(lockKey)) {
+            resolve({
+                success: false,
+                exit_code: 1,
+                stdout: '',
+                stderr: 'Deploy already running for this environment.',
+                duration_ms: 0,
+            });
+            return;
+        }
+
+        if (definition.locked) {
+            runningEnvActions.set(lockKey, 'deploy');
+        }
+
+        const startedAt = Date.now();
+        const spec = commandSpec(definition, site, env);
+
+        const createdPaths = [];
+        const trackPath = (p) => {
+            if (p && typeof p === 'string') {
+                createdPaths.push(p);
+                if (extraCleanupPaths && typeof extraCleanupPaths.push === 'function') {
+                    extraCleanupPaths.push(p);
+                }
+            }
+        };
+        const cleanupKey = () => {
+            while (createdPaths.length) {
+                const p = createdPaths.pop();
+                try {
+                    if (p) fs.unlinkSync(p);
+                } catch (_) {
+                    /* ignore */
+                }
+            }
+        };
+
+        let childEnv = { ...process.env };
+        try {
+            if (deployKeyB64 && typeof deployKeyB64 === 'string' && deployKeyB64.trim() !== '') {
+                const keyDir = panelDeployKeyDir();
+                const keyPath = path.join(keyDir, `rp-poll-key-${process.pid}-${Date.now()}.key`);
+                fs.writeFileSync(keyPath, Buffer.from(deployKeyB64.trim(), 'base64'), { mode: 0o600 });
+                trackPath(keyPath);
+                childEnv = { ...childEnv, RELEASEPANEL_PANEL_DEPLOY_KEY_FILE: keyPath };
+            }
+            const kh = deployKnownHostsB64 && typeof deployKnownHostsB64 === 'string' ? deployKnownHostsB64.trim() : '';
+            if (kh !== '') {
+                const keyDir = panelDeployKeyDir();
+                const knownPath = path.join(keyDir, `rp-poll-known-${process.pid}-${Date.now()}`);
+                fs.writeFileSync(knownPath, Buffer.from(kh, 'base64'), { mode: 0o600 });
+                trackPath(knownPath);
+                childEnv = { ...childEnv, RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE: knownPath };
+            } else if (deployKeyB64 && typeof deployKeyB64 === 'string' && deployKeyB64.trim() !== '') {
+                childEnv = { ...childEnv, RELEASEPANEL_PANEL_ACCEPT_NEW_GIT: '1' };
+            }
+        } catch (err) {
+            cleanupKey();
+            if (definition.locked) {
+                runningEnvActions.delete(lockKey);
+            }
+            resolve({
+                success: false,
+                exit_code: 1,
+                stdout: '',
+                stderr: err.message || String(err),
+                duration_ms: Date.now() - startedAt,
+            });
+            return;
+        }
+
+        const child = spawn(spec.command, spec.args, {
+            shell: false,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: childEnv,
+        });
+
+        let stdout = '';
+        let stderr = '';
+        let timedOut = false;
+
+        const timer = setTimeout(() => {
+            timedOut = true;
+            child.kill('SIGTERM');
+        }, definition.timeoutMs);
+
+        child.stdout.on('data', (chunk) => {
+            stdout += chunk.toString();
+        });
+
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+
+        child.on('error', (error) => {
+            stderr += error.message;
+            cleanupKey();
+        });
+
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            cleanupKey();
+
+            if (definition.locked) {
+                runningEnvActions.delete(lockKey);
+            }
+
+            const durationMs = Date.now() - startedAt;
+            const success = code === 0 && !timedOut;
+            const exitCode = typeof code === 'number' ? code : 1;
+
+            appendLog({
+                method: 'POST',
+                path: '/poll/deploy',
+                site,
+                env,
+                action: 'deploy',
+                requester_ip: 'poll',
+                success,
+                exit_code: exitCode,
+                duration_ms: durationMs,
+            });
+
+            resolve({
+                success,
+                exit_code: exitCode,
+                stdout,
+                stderr: timedOut ? `${stderr}\nCommand timed out.`.trim() : stderr,
+                duration_ms: durationMs,
+            });
+        });
+    });
+}
+
+async function reportAgentJobResult(jobId, status, result, errorMessage) {
+    const payload = {
+        job_id: jobId,
+        status,
+        result: result || {},
+    };
+    if (errorMessage) {
+        payload.error = String(errorMessage).slice(0, 5000);
+    }
+    try {
+        const res = await panelFetchJson('/api/agent/job-result', { method: 'POST', bodyObj: payload });
+        appendLog({
+            event: 'agent_job_result',
+            job_id: jobId,
+            status,
+            http_ok: res.ok,
+            http_status: res.status,
+        });
+    } catch (err) {
+        appendLog({
+            event: 'agent_job_result_error',
+            job_id: jobId,
+            status,
+            message: err.message,
+        });
+    }
+}
+
+/**
+ * Removes RELEASEPANEL_KNOWN_HOSTS_AUTO_PIN_B64 lines from deploy text for cleaner panel logs.
+ * Returns the last captured payload (host keys, base64) for structured agent results.
+ *
+ * @param {string} text
+ * @returns {{ cleaned: string, autoPinB64: string | null }}
+ */
+function extractAutoPinB64FromDeployOutput(text) {
+    if (text == null || typeof text !== 'string') {
+        return { cleaned: '', autoPinB64: null };
+    }
+    const reLine = /^RELEASEPANEL_KNOWN_HOSTS_AUTO_PIN_B64=(.+)$/gm;
+    let autoPinB64 = null;
+    let m;
+    while ((m = reLine.exec(text)) !== null) {
+        const v = m[1].trim();
+        if (v !== '') {
+            autoPinB64 = v;
+        }
+    }
+    const cleaned = text
+        .replace(/^RELEASEPANEL_KNOWN_HOSTS_AUTO_PIN_B64=.*$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    return { cleaned, autoPinB64 };
+}
+
+async function executePollDeployJob(job) {
+    const payload = job.payload || {};
+    const site = payload.site;
+    const env = payload.env;
+
+    if (!isSafeSlug(site) || !isSafeSlug(env)) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'invalid_payload' }, 'Invalid site/env in job payload');
+        return;
+    }
+
+    if (!fs.existsSync(siteConfigPath(site, env))) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_site_env_config' }, `Missing site env file for ${site}/${env}`);
+        return;
+    }
+
+    await reportAgentJobResult(job.id, 'running', {});
+
+    const cleanupPaths = [];
+    try {
+        const dk = typeof payload.deploy_key_b64 === 'string' ? payload.deploy_key_b64 : '';
+        const kh = typeof payload.deploy_known_hosts_b64 === 'string' ? payload.deploy_known_hosts_b64 : '';
+        const outcome = await runDeploySyncForPoll(
+            site,
+            env,
+            dk.trim() !== '' ? dk : null,
+            kh.trim() !== '' ? kh : null,
+            cleanupPaths,
+        );
+        const rawMerged = `${outcome.stdout || ''}\n${outcome.stderr || ''}`;
+        const { cleaned, autoPinB64 } = extractAutoPinB64FromDeployOutput(rawMerged);
+        const mergedOut = truncateForAgentPanel(cleaned, maxAgentPanelOutputChars);
+        /** @type {Record<string, unknown>} */
+        const resultPayload = {
+            output: mergedOut,
+            exit_code: outcome.exit_code,
+            deploy: { exit_code: outcome.exit_code, duration_ms: outcome.duration_ms },
+        };
+        const minAutoPinB64 = 16;
+        const maxAutoPinB64 = 65536;
+        if (autoPinB64 && autoPinB64.length >= minAutoPinB64 && autoPinB64.length <= maxAutoPinB64) {
+            resultPayload.known_hosts_auto_pin_b64 = autoPinB64;
+        }
+        if (outcome.success) {
+            await reportAgentJobResult(job.id, 'succeeded', resultPayload);
+        } else {
+            await reportAgentJobResult(job.id, 'failed', resultPayload, outcome.stderr || 'deploy failed');
+        }
+    } catch (err) {
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+    } finally {
+        for (const p of cleanupPaths) {
+            try {
+                if (p) fs.unlinkSync(p);
+            } catch (_) {
+                /* ignore */
+            }
+        }
+    }
+}
+
+async function executePollSiteCreateJob(job) {
+    const payload = job.payload || {};
+    const command = typeof payload.command === 'string' ? payload.command : '';
+    if (!command.trim()) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_command' }, 'Missing site-create script in job payload');
+        return;
+    }
+
+    await reportAgentJobResult(job.id, 'running', {});
+
+    const tmp = `/tmp/rp-site-create-${job.id}-${process.pid}.sh`;
+
+    try {
+        fs.writeFileSync(tmp, command, { mode: 0o600 });
+        const outcome = await new Promise((resolve) => {
+            let stdout = '';
+            let stderr = '';
+            const child = spawn('sudo', ['-n', 'bash', tmp], {
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const timer = setTimeout(() => {
+                child.kill('SIGTERM');
+            }, provisionTimeoutMs);
+            child.stdout.on('data', (chunk) => {
+                stdout += chunk.toString();
+            });
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
+            });
+            child.on('error', (error) => {
+                stderr += error.message;
+            });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                resolve({
+                    success: code === 0,
+                    exit_code: typeof code === 'number' ? code : 1,
+                    stdout,
+                    stderr,
+                });
+            });
+        });
+
+        const mergedOut = truncateForAgentPanel(`${outcome.stdout || ''}\n${outcome.stderr || ''}`, maxAgentPanelOutputChars);
+        if (outcome.success) {
+            await reportAgentJobResult(job.id, 'succeeded', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            });
+        } else {
+            let errMsg = (outcome.stderr || outcome.stdout || 'site create failed').trim();
+            const sudoHint = explainProvisionSudoFailure(outcome.stdout, outcome.stderr);
+            if (sudoHint) {
+                errMsg = errMsg ? `${errMsg}.${sudoHint}` : `Site create failed.${sudoHint}`;
+            }
+            await reportAgentJobResult(job.id, 'failed', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            }, errMsg);
+        }
+    } catch (err) {
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+    } finally {
+        try {
+            fs.unlinkSync(tmp);
+        } catch {
+            // ignore
+        }
+    }
+}
+
+async function executePollProvisionJob(job) {
+    const payload = job.payload || {};
+    const script = typeof payload.script === 'string' ? payload.script : '';
+    if (!script.trim()) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_script' }, 'Missing provision script in job payload');
+        return;
+    }
+
+    await reportAgentJobResult(job.id, 'running', {});
+
+    const tmp = `/tmp/rp-provision-${job.id}-${process.pid}.sh`;
+
+    try {
+        fs.writeFileSync(tmp, script, { mode: 0o600 });
+        const outcome = await new Promise((resolve) => {
+            let stdout = '';
+            let stderr = '';
+            const child = spawn('sudo', ['-n', 'bash', tmp], {
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const timer = setTimeout(() => {
+                child.kill('SIGTERM');
+            }, provisionTimeoutMs);
+            child.stdout.on('data', (chunk) => {
+                stdout += chunk.toString();
+            });
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
+            });
+            child.on('error', (error) => {
+                stderr += error.message;
+            });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                resolve({
+                    success: code === 0,
+                    exit_code: typeof code === 'number' ? code : 1,
+                    stdout,
+                    stderr,
+                });
+            });
+        });
+
+        const mergedOut = truncateForAgentPanel(`${outcome.stdout || ''}\n${outcome.stderr || ''}`, maxAgentPanelOutputChars);
+        if (outcome.success) {
+            await reportAgentJobResult(job.id, 'succeeded', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            });
+        } else {
+            let errMsg = (outcome.stderr || outcome.stdout || 'provision failed').trim();
+            const sudoHint = explainProvisionSudoFailure(outcome.stdout, outcome.stderr);
+            if (sudoHint) {
+                errMsg = errMsg ? `${errMsg}.${sudoHint}` : `Provision failed.${sudoHint}`;
+            }
+            await reportAgentJobResult(job.id, 'failed', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            }, errMsg);
+        }
+    } catch (err) {
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+    } finally {
+        try {
+            fs.unlinkSync(tmp);
+        } catch {
+            // ignore
+        }
+    }
+}
+
+async function executePollSslEnableJob(job) {
+    const payload = job.payload || {};
+    const command = typeof payload.command === 'string' ? payload.command : '';
+    if (!command.trim()) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_command' }, 'Missing ssl-enable script in job payload');
+        return;
+    }
+
+    await reportAgentJobResult(job.id, 'running', {});
+
+    const tmp = `/tmp/rp-ssl-enable-${job.id}-${process.pid}.sh`;
+
+    try {
+        fs.writeFileSync(tmp, command, { mode: 0o600 });
+        const outcome = await new Promise((resolve) => {
+            let stdout = '';
+            let stderr = '';
+            const child = spawn('sudo', ['-n', 'bash', tmp], {
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const timer = setTimeout(() => {
+                child.kill('SIGTERM');
+            }, provisionTimeoutMs);
+            child.stdout.on('data', (chunk) => {
+                stdout += chunk.toString();
+            });
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
+            });
+            child.on('error', (error) => {
+                stderr += error.message;
+            });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                resolve({
+                    success: code === 0,
+                    exit_code: typeof code === 'number' ? code : 1,
+                    stdout,
+                    stderr,
+                });
+            });
+        });
+
+        const mergedOut = truncateForAgentPanel(`${outcome.stdout || ''}\n${outcome.stderr || ''}`, maxAgentPanelOutputChars);
+        if (outcome.success) {
+            await reportAgentJobResult(job.id, 'succeeded', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            });
+        } else {
+            let errMsg = (outcome.stderr || outcome.stdout || 'ssl enable failed').trim();
+            const sudoHint = explainProvisionSudoFailure(outcome.stdout, outcome.stderr);
+            if (sudoHint) {
+                errMsg = errMsg ? `${errMsg}.${sudoHint}` : `SSL enable failed.${sudoHint}`;
+            }
+            await reportAgentJobResult(job.id, 'failed', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            }, errMsg);
+        }
+    } catch (err) {
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+    } finally {
+        try {
+            fs.unlinkSync(tmp);
+        } catch {
+            // ignore
+        }
+    }
+}
+
+async function executePollPromoteJob(job) {
+    const payload = job.payload || {};
+    const site = payload.site;
+    const fromEnv = payload.from_env;
+    const toEnv = payload.to_env;
+
+    if (!isSafeSlug(site) || !isSafeSlug(fromEnv) || !isSafeSlug(toEnv)) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'invalid_payload' }, 'Invalid promote payload');
+        return;
+    }
+
+    if (!fs.existsSync(siteConfigPath(site, fromEnv))) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_site_env_config' }, `Missing site env file for ${site}/${fromEnv}`);
+        return;
+    }
+
+    const lockKey = `${site}/${toEnv}:deploy`;
+    if (runningEnvActions.has(lockKey)) {
+        await reportAgentJobResult(job.id, 'failed', { reason: 'locked' }, `Action already running for ${site}/${toEnv}`);
+        return;
+    }
+
+    runningEnvActions.set(lockKey, 'promote');
+    await reportAgentJobResult(job.id, 'running', {});
+
+    let spec;
+    try {
+        spec = commandSpec(promoteAction, site, fromEnv, toEnv);
+    } catch (err) {
+        runningEnvActions.delete(lockKey);
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+        return;
+    }
+
+    const startedAt = Date.now();
+    try {
+        const outcome = await new Promise((resolve) => {
+            let stdout = '';
+            let stderr = '';
+            const child = spawn(spec.command, spec.args, {
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const timer = setTimeout(() => {
+                child.kill('SIGTERM');
+            }, promoteAction.timeoutMs);
+            child.stdout.on('data', (chunk) => {
+                stdout += chunk.toString();
+            });
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
+            });
+            child.on('error', (error) => {
+                stderr += error.message;
+            });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                resolve({
+                    success: code === 0,
+                    exit_code: typeof code === 'number' ? code : 1,
+                    stdout,
+                    stderr,
+                });
+            });
+        });
+
+        const mergedOut = truncateForAgentPanel(`${outcome.stdout || ''}\n${outcome.stderr || ''}`, maxAgentPanelOutputChars);
+        if (outcome.success) {
+            await reportAgentJobResult(job.id, 'succeeded', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            });
+        } else {
+            await reportAgentJobResult(job.id, 'failed', {
+                output: mergedOut,
+                exit_code: outcome.exit_code,
+            }, (outcome.stderr || outcome.stdout || 'promote failed').trim());
+        }
+    } catch (err) {
+        await reportAgentJobResult(job.id, 'failed', { exit_code: 1 }, err.message || String(err));
+    } finally {
+        runningEnvActions.delete(lockKey);
+        appendLog({
+            event: 'agent_poll_promote',
+            site,
+            from_env: fromEnv,
+            to_env: toEnv,
+            duration_ms: Date.now() - startedAt,
+            job_id: job.id,
+        });
+    }
+}
+
+let pollCycleBusy = false;
+
+async function runAgentPollCycle() {
+    if (!pollEnabled || !panelUrl || !apiKey) {
+        return;
+    }
+    if (pollCycleBusy) {
+        return;
+    }
+    pollCycleBusy = true;
+    try {
+        const res = await panelFetchJson('/api/agent/poll', {
+            method: 'POST',
+            bodyObj: {
+                agent_version: envPair('MANAGED_AGENT_RUNNER_VERSION', 'RELEASEPANEL_RUNNER_VERSION', 'local'),
+                capabilities: ['deploy', 'provision', 'site_create', 'ssl_enable', 'promote'],
+            },
+        });
+        appendLog({
+            event: 'agent_poll',
+            http_ok: res.ok,
+            http_status: res.status,
+        });
+        if (!res.ok || !res.json || !res.json.job) {
+            return;
+        }
+        const job = res.json.job;
+        if (job.type === 'deploy') {
+            await executePollDeployJob(job);
+        } else if (job.type === 'provision') {
+            await executePollProvisionJob(job);
+        } else if (job.type === 'site_create') {
+            await executePollSiteCreateJob(job);
+        } else if (job.type === 'ssl_enable') {
+            await executePollSslEnableJob(job);
+        } else if (job.type === 'promote') {
+            await executePollPromoteJob(job);
+        }
+    } catch (error) {
+        appendLog({
+            event: 'agent_poll_error',
+            message: error.message,
+        });
+    } finally {
+        pollCycleBusy = false;
+    }
+}
+
+const server = app.listen(port, host, () => {
     appendLog({
         action: 'start',
         success: true,
@@ -1913,4 +2841,20 @@ app.listen(port, host, () => {
 
     sendHeartbeat();
     setInterval(sendHeartbeat, heartbeatIntervalMs);
+
+    if (pollEnabled && panelUrl) {
+        runAgentPollCycle();
+        setInterval(runAgentPollCycle, pollIntervalMs);
+    }
+});
+
+server.on('error', (err) => {
+    console.error(`[managed-deploy-agent] listen failed on ${host}:${port}: ${err.code || ''} ${err.message}`.trim());
+    appendLog({
+        action: 'listen_error',
+        success: false,
+        message: err.message,
+        code: err.code || null,
+    });
+    process.exit(1);
 });

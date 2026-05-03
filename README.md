@@ -40,13 +40,19 @@ Use real CA-backed TLS in production when possible.
 
 ## Maintainer sync
 
-Canonical shell sources live in your **private** deploy monorepo. After editing there:
+Canonical sources live in the **private** **releasepanel-deploy** monorepo. After changing toolkit shells, the Node agent, or **`install.sh` / `install-managed-vps.sh`** there, push the public bundle from that repo:
 
 ```bash
-./scripts/export-public-runner-toolkit.sh /path/to/managed-deploy-agent
+cd /path/to/releasepanel-deploy
+./scripts/publish-releasepanel-runner.sh /path/to/releasepanel-runner
+cd /path/to/releasepanel-runner
+npm ci
+git diff
+git commit -am "Sync from releasepanel-deploy"   # or commit selectively
+git push
 ```
 
-Then reconcile `toolkit/bin/releasepanel` if needed and commit. See **`REPO_RECREATE.md`** for a clean GitHub history / rename checklist.
+`publish-releasepanel-runner.sh` calls `export-public-runner-toolkit.sh`, which omits control-plane-only scripts (bootstrap panel, self-update, etc.); those stay in the private repo only. Reconcile **`toolkit/bin/releasepanel`** in this tree if you hand-edit the agent CLI. See **`REPO_RECREATE.md`** for a clean GitHub history / rename checklist.
 
 ## Repo recreation
 

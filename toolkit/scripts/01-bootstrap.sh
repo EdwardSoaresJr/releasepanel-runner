@@ -114,6 +114,11 @@ if ! command -v node >/dev/null 2>&1 || ! node --version | grep -q '^v20\.'; the
     apt_get_noninteractive install -y nodejs
 fi
 
+if ! command -v npm >/dev/null 2>&1; then
+    echo "[bootstrap] npm missing after Node install; installing npm."
+    apt_get_noninteractive install -y npm
+fi
+
 if ! apt_package_available "php${PHP_VERSION}"; then
     echo "[bootstrap] PHP ${PHP_VERSION} is not available from current apt sources; adding Ondrej PHP repository."
     install_ondrej_php_repo
@@ -189,7 +194,10 @@ fi
 
 mkdir -p /var/www/sites
 mkdir -p "${TOOLKIT_DIR}/sites"
-ln -sf "${TOOLKIT_DIR}/bin/releasepanel" /usr/local/bin/releasepanel
+ln -sf "${TOOLKIT_DIR}/bin/managed-deploy" /usr/local/bin/managed-deploy
+if [ "${RELEASEPANEL_SKIP_APP_BOOTSTRAP:-false}" != "true" ]; then
+    ln -sf "${TOOLKIT_DIR}/bin/releasepanel" /usr/local/bin/releasepanel
+fi
 
 chown -R www-data:www-data /var/www
 chmod -R 755 /var/www
@@ -209,7 +217,7 @@ systemctl reload nginx
 echo "[bootstrap] System bootstrap complete."
 
 if [ "${RELEASEPANEL_SKIP_APP_BOOTSTRAP:-false}" = "true" ]; then
-    echo "[bootstrap] Skipping ReleasePanel deployment because RELEASEPANEL_SKIP_APP_BOOTSTRAP=true."
+    echo "[bootstrap] Skipping control-plane app install (RELEASEPANEL_SKIP_APP_BOOTSTRAP=true). Managed-agent host only — no hosted panel deployed here."
     install -d -m 0755 /var/lib/managed-deploy-agent
     touch /var/lib/managed-deploy-agent/bootstrap-runner.completed
     echo "[bootstrap] COMPLETE"
@@ -217,7 +225,7 @@ if [ "${RELEASEPANEL_SKIP_APP_BOOTSTRAP:-false}" = "true" ]; then
 fi
 
 if [ -f "${SCRIPT_DIR}/bootstrap-releasepanel.sh" ]; then
-    echo "[bootstrap] Starting ReleasePanel deployment..."
+    echo "[bootstrap] Starting control-plane bootstrap (hosted panel)..."
     bash "${SCRIPT_DIR}/bootstrap-releasepanel.sh"
 else
     echo "[bootstrap] ERROR: Missing bootstrap-releasepanel.sh (managed-server toolkit has no control-plane bootstrap; use: sudo releasepanel bootstrap-runner)"

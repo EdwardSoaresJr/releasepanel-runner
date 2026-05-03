@@ -1,7 +1,7 @@
 {
   "name": "managed-deploy-agent",
   "version": "1.0.0",
-  "description": "On-server managed deploy agent (Node) with embedded shell toolkit (toolkit/). Public single-clone install for customer app servers.",
+  "description": "On-server managed deploy agent (Node) used from deploy repo runner/",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -14,14 +14,5 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/EdwardSoaresJr/releasepanel-runner.git"
-  },
-  "keywords": [
-    "deploy",
-    "agent",
-    "laravel"
-  ]
+  "license": "MIT"
 }

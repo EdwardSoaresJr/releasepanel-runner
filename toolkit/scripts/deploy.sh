@@ -14,6 +14,24 @@ load_env
 require_env_value RELEASEPANEL_REPO
 require_composer
 
+if [ -n "${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE:-}" ] && [ -r "${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE}" ]; then
+  RELEASEPANEL_SSH_IDENTITY_FILE="${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE}"
+  if [ -n "${RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE:-}" ] && [ -r "${RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE}" ]; then
+    RELEASEPANEL_GIT_SSH_COMMAND="ssh -i ${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE} -o IdentitiesOnly=yes -o UserKnownHostsFile=${RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE} -o StrictHostKeyChecking=yes"
+  else
+    RELEASEPANEL_GIT_SSH_COMMAND="ssh -i ${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  fi
+fi
+
+if [ -n "${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE:-}" ] && [ -r "${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE}" ]; then
+    echo "[releasepanel] Using panel deploy key: yes"
+    if [ -n "${RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE:-}" ] && [ -r "${RELEASEPANEL_PANEL_KNOWN_HOSTS_FILE}" ]; then
+        echo "[releasepanel] Using pinned known_hosts: yes"
+    else
+        echo "[releasepanel] Using pinned known_hosts: no (accept-new)"
+    fi
+fi
+
 if [ ! -x "$(command -v "php${RELEASEPANEL_PHP_VERSION}" 2>/dev/null || true)" ] || [ ! -S "/run/php/php${RELEASEPANEL_PHP_VERSION}-fpm.sock" ]; then
     "${SCRIPT_DIR}/install-php-runtime.sh" "${RELEASEPANEL_PHP_VERSION}"
 fi
@@ -75,7 +93,7 @@ fi
 
 log "Starting release deploy to ${release}."
 echo "[releasepanel] Step: Cloning repository"
-if [ -n "${RELEASEPANEL_SSH_IDENTITY_FILE:-}" ] && [[ "${RELEASEPANEL_SSH_IDENTITY_FILE}" == /root/* ]]; then
+if [ -n "${RELEASEPANEL_SSH_IDENTITY_FILE:-}" ] && [ -n "${RELEASEPANEL_GIT_SSH_COMMAND:-}" ] && { [[ "${RELEASEPANEL_SSH_IDENTITY_FILE}" == /root/* ]] || [ -n "${RELEASEPANEL_PANEL_DEPLOY_KEY_FILE:-}" ]; }; then
     GIT_SSH_COMMAND="${RELEASEPANEL_GIT_SSH_COMMAND}" git clone --no-checkout "${RELEASEPANEL_REPO}" "${release}"
     GIT_SSH_COMMAND="${RELEASEPANEL_GIT_SSH_COMMAND}" git -C "${release}" fetch origin "${RELEASEPANEL_BRANCH}"
     if [ -n "${RELEASEPANEL_DEPLOY_COMMIT_SHA:-}" ]; then
@@ -105,6 +123,32 @@ else
         run_as_app_user_in "${release}" git checkout --force -B "${RELEASEPANEL_BRANCH}" "origin/${RELEASEPANEL_BRANCH}"
     fi
 fi
+
+releasepanel_git_ssh_host_from_repo() {
+    local r="$1"
+    if [[ "$r" =~ ^git@([^:]+): ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$r" =~ ^ssh://([^/@]+@)?([^/:]+) ]]; then
+        echo "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+if [ "${RELEASEPANEL_PANEL_ACCEPT_NEW_GIT:-}" = "1" ] && command -v ssh-keyscan >/dev/null 2>&1; then
+    _rp_pin_host="$(releasepanel_git_ssh_host_from_repo "${RELEASEPANEL_REPO}" || true)"
+    if [ -n "${_rp_pin_host}" ]; then
+        _rp_scan="$(ssh-keyscan -T 10 -t rsa,ecdsa,ed25519 "${_rp_pin_host}" 2>/dev/null | grep -v '^#' | grep -v '^$' || true)"
+        if [ -n "${_rp_scan}" ]; then
+            _rp_b64="$(printf '%s\n' "${_rp_scan}" | base64 | tr -d '\n')"
+            echo "RELEASEPANEL_KNOWN_HOSTS_AUTO_PIN_B64=${_rp_b64}"
+            echo "[releasepanel] Recorded host keys for auto-pin (persisted on deploy host)."
+        fi
+    fi
+fi
+
 sha="$(run_as_app_user_in "${release}" git rev-parse HEAD)"
 promote_app_subdir_release
 
@@ -172,9 +216,39 @@ echo "[releasepanel] Step: Reloading PHP-FPM and workers"
 reload_php_fpm
 restart_workers
 
-if [ "${RELEASEPANEL_TLS_MODE:-}" = "self-signed" ] && [ ! -f "/etc/letsencrypt/live/${RELEASEPANEL_SERVER_NAME}/fullchain.pem" ]; then
-    echo "[releasepanel] Step: Self-signed TLS nginx (RELEASEPANEL_TLS_MODE=self-signed; no Let's Encrypt certificate yet)"
-    RELEASEPANEL_DEPLOY_ENV="${RELEASEPANEL_DEPLOY_ENV}" bash "${SCRIPT_DIR}/08-nginx-https-selfsigned.sh" "${RELEASEPANEL_SITE_SLUG}-${RELEASEPANEL_ENV_SLUG}"
+releasepanel_le_cert="/etc/letsencrypt/live/${RELEASEPANEL_SERVER_NAME}/fullchain.pem"
+releasepanel_skip_tls_deploy=false
+case "${RELEASEPANEL_DEPLOY_SKIP_SSL:-false}" in
+    1 | true | TRUE | yes | YES)
+        releasepanel_skip_tls_deploy=true
+        warn "Skipping TLS nginx changes during deploy (RELEASEPANEL_DEPLOY_SKIP_SSL=true)."
+        ;;
+esac
+
+releasepanel_want_letsencrypt_deploy=false
+if [ "${releasepanel_skip_tls_deploy}" != true ] && [ -n "${RELEASEPANEL_SSL_EMAIL:-}" ]; then
+    case "${RELEASEPANEL_TLS_MODE:-}" in
+        letsencrypt)
+            releasepanel_want_letsencrypt_deploy=true
+            ;;
+    esac
+    case "${RELEASEPANEL_DEPLOY_TRY_LETS_ENCRYPT:-false}" in
+        1 | true | TRUE | yes | YES)
+            releasepanel_want_letsencrypt_deploy=true
+            ;;
+    esac
+fi
+
+if [ "${releasepanel_want_letsencrypt_deploy}" = true ]; then
+    echo "[releasepanel] Step: Let's Encrypt + HTTPS nginx (same as releasepanel site ssl; DNS must point at this server)"
+    RELEASEPANEL_DEPLOY_ENV="${RELEASEPANEL_DEPLOY_ENV}" bash "${SCRIPT_DIR}/site-ssl.sh" "${RELEASEPANEL_ENV}"
+elif [ "${releasepanel_skip_tls_deploy}" != true ] \
+    && [ "${RELEASEPANEL_TLS_MODE:-}" = "self-signed" ]; then
+    fail "RELEASEPANEL_TLS_MODE=self-signed is no longer supported. Use letsencrypt with RELEASEPANEL_SSL_EMAIL (DNS must point at this server), tls_mode none, or RELEASEPANEL_DEPLOY_SKIP_SSL=true."
+elif [ "${releasepanel_skip_tls_deploy}" != true ] \
+    && [ "${RELEASEPANEL_TLS_MODE:-}" = "letsencrypt" ] \
+    && [ -z "${RELEASEPANEL_SSL_EMAIL:-}" ]; then
+    warn "RELEASEPANEL_TLS_MODE=letsencrypt but RELEASEPANEL_SSL_EMAIL is empty; skipping Certbot during deploy. Add email to ${RELEASEPANEL_DEPLOY_ENV} or run: releasepanel site ssl ${RELEASEPANEL_SITE_SLUG} ${RELEASEPANEL_ENV_SLUG}"
 fi
 
 smoke_status=0
@@ -220,6 +294,26 @@ elif ! local_https_check true; then
 fi
 
 write_deploy_stamp "${release}" "success" "${sha}"
+
+# Panel `site deploy` does not run `self-update`; without this step the encrypted `servers.runner_key`
+# can drift from `shared/.env` / the host agent after APP_KEY or env changes → runner returns 401 Unauthorized.
+# Skip on first deploy: DB migrations run after deploy.sh returns from bootstrap.
+if [ "${first_deploy}" != "true" ]; then
+    case "${RELEASEPANEL_SITE_SLUG}:${RELEASEPANEL_ENV_SLUG}" in
+        releasepanel-app:production)
+            case "${RELEASEPANEL_SKIP_SELF_HEAL_AFTER_SITE_DEPLOY:-false}" in
+                1 | true | TRUE | yes | YES)
+                    log "Skipping panel self-heal (RELEASEPANEL_SKIP_SELF_HEAL_AFTER_SITE_DEPLOY=true)."
+                    ;;
+                *)
+                    log "ReleasePanel panel deploy: sync-self-site + heartbeat (keeps runner key aligned with Laravel .env)."
+                    releasepanel_heal_self_host_runner_credentials ||
+                        warn "Panel self-heal failed; runner actions may return Unauthorized until fixed. Run: sudo releasepanel heal-self-runner"
+                    ;;
+            esac
+            ;;
+    esac
+fi
 
 log "Pruning old releases after successful deploy."
 find "${RELEASEPANEL_RELEASES}" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +6 | xargs -r rm -rf

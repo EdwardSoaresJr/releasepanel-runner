@@ -3,6 +3,18 @@
 # ReleasePanel MySQL health (control plane). Root useful for service checks.
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+. "${SCRIPT_DIR}/../lib/common.sh"
+if [ -f "${RELEASEPANEL_TOOLKIT_DIR}/deploy.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${RELEASEPANEL_TOOLKIT_DIR}/deploy.env"
+    set +a
+fi
+: "${RELEASEPANEL_PHP_VERSION:=${PHP_VERSION:-8.3}}"
+PHP_CLI="$(php_binary)"
+
 BASE_PATH="/var/www/sites/releasepanel-app/production"
 
 show_status() {
@@ -24,7 +36,7 @@ show_status() {
 
     echo ""
     echo "=== Laravel DB connection ==="
-    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && php artisan tinker --execute=\"
+    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && $(printf '%q' "${PHP_CLI}") artisan tinker --execute=\"
         try {
             \\\$pdo = DB::connection()->getPdo();
             echo get_class(\\\$pdo).' | db='.DB::connection()->getDatabaseName().PHP_EOL;
@@ -35,11 +47,11 @@ show_status() {
 
     echo ""
     echo "=== Migration status (first 30 lines) ==="
-    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && php artisan migrate:status --no-interaction" 2>/dev/null | head -30 || echo "[warn] migrate:status failed"
+    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && $(printf '%q' "${PHP_CLI}") artisan migrate:status --no-interaction" 2>/dev/null | head -30 || echo "[warn] migrate:status failed"
 
     echo ""
     echo "=== Database size (information_schema) ==="
-    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && php artisan tinker --execute=\"
+    sudo -u releasepanel bash -lc "cd $(printf '%q' "${BASE_PATH}/current") && $(printf '%q' "${PHP_CLI}") artisan tinker --execute=\"
         try {
             \\\$db = DB::connection()->getDatabaseName();
             \\\$r = DB::selectOne(

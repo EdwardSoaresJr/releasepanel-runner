@@ -21,8 +21,6 @@ tls_mode="${RELEASEPANEL_TLS_MODE:-}"
 if [ -z "${tls_mode}" ]; then
     if [ -f "/etc/letsencrypt/live/${RELEASEPANEL_SERVER_NAME}/fullchain.pem" ]; then
         tls_mode="letsencrypt"
-    elif [ -f "/etc/ssl/releasepanel/${RELEASEPANEL_SERVER_NAME}/fullchain.pem" ]; then
-        tls_mode="self-signed"
     else
         tls_mode="none"
     fi
@@ -33,7 +31,8 @@ case "${tls_mode}" in
         exec bash "${RELEASEPANEL_TOOLKIT_DIR}/scripts/nginx-http-app.sh" "${SITE_ENV_NAME}"
         ;;
     self-signed)
-        exec bash "${RELEASEPANEL_TOOLKIT_DIR}/scripts/08-nginx-https-selfsigned.sh" "${SITE_ENV_NAME}"
+        echo "[error] RELEASEPANEL_TLS_MODE=self-signed is no longer supported. Use letsencrypt (with RELEASEPANEL_SSL_EMAIL and DNS) or none." >&2
+        exit 2
         ;;
     *)
         exec bash "${RELEASEPANEL_TOOLKIT_DIR}/scripts/08-nginx-final.sh" "${SITE_ENV_NAME}"
