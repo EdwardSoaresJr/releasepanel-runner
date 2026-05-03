@@ -11,6 +11,8 @@ Public **on-server agent** for customer VPSes: a small **Node.js** process plus 
 
 Default clone directory: **`/opt/managed-deploy-agent`**. Override clone target with **`MANAGED_AGENT_INSTALL_DIR`** when piping `install-managed-vps.sh`.
 
+**ReleasePanel control-plane host:** the same repo is cloned to **`/opt/releasepanel-runner`** by **`releasepanel sync-runner`** (bootstrap and **`self-update`**). There is no second copy of **`server.js`** inside private **releasepanel-deploy**.
+
 **Fresh server:** the bootstrap expects a **new Ubuntu VPS** with **no** `nginx`, `apache2`, `caddy`, or `lighttpd` installed yet. If you must install on a box that already has a web stack, set **`MANAGED_AGENT_SKIP_FRESH_SERVER_CHECK=1`** (you are responsible for port/site conflicts).
 
 The control plane calls the agent with header **`X-Managed-Agent-Key`** (legacy **`X-RELEASEPANEL-KEY`** is still accepted). Configure the shared secret as **`MANAGED_AGENT_RUNNER_KEY`** (or legacy **`RELEASEPANEL_RUNNER_KEY`**) in `.env`.
