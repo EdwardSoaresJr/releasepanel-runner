@@ -278,6 +278,11 @@ validate_nginx_domain_file() {
     if ! grep -Eq "^[[:space:]]*server_name[[:space:]].*\\b${domain_regex}\\b.*;[[:space:]]*$" "${file}"; then
         fail "nginx config ${file} must include ${RELEASEPANEL_SERVER_NAME}."
     fi
+
+    if grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "${file}" \
+        && ! grep -qE '^[[:space:]]*listen[[:space:]]+.*443' "${file}"; then
+        fail "nginx config ${file} sets ssl_certificate but has no listen 443 — add e.g. \"listen 443 ssl http2;\" to the TLS server block."
+    fi
 }
 
 run_as_app_user() {
@@ -505,6 +510,306 @@ php_binary() {
     fail "PHP ${RELEASEPANEL_PHP_VERSION} CLI missing. Run: releasepanel install-php ${RELEASEPANEL_PHP_VERSION}"
 }
 
+# Directory containing server.js (classic: toolkit/runner, bundle: repo root with toolkit/ sibling).
+releasepanel_resolve_runner_directory() {
+    local toolkit="${RELEASEPANEL_TOOLKIT_DIR:-/opt/releasepanel-deploy}"
+
+    if [ -f "${toolkit}/../server.js" ]; then
+        printf '%s\n' "$(cd "${toolkit}/.." && pwd)"
+    else
+        printf '%s\n' "${toolkit}/runner"
+    fi
+}
+
+releasepanel_write_managed_agent_systemd_unit() {
+    local runner_dir="$1"
+    local toolkit_dir="$2"
+    local node_bin="${3:-}"
+    local service_target="/etc/systemd/system/managed-deploy-agent.service"
+    local service_source="${toolkit_dir}/systemd/managed-deploy-agent.service.example"
+
+    if [ -z "${node_bin}" ]; then
+        node_bin="$(command -v node 2>/dev/null || true)"
+    fi
+    if [ -z "${node_bin}" ]; then
+        node_bin="/usr/bin/node"
+    fi
+    if [ ! -x "${node_bin}" ]; then
+        warn "releasepanel_write_managed_agent_systemd_unit: node binary not executable at ${node_bin}"
+        return 1
+    fi
+
+    if [ ! -f "${service_source}" ]; then
+        warn "releasepanel_write_managed_agent_systemd_unit: missing ${service_source}"
+        return 1
+    fi
+
+    sed -e "s|__RUNNER_DIR__|${runner_dir}|g" -e "s|__NODE_BIN__|${node_bin}|g" "${service_source}" > "${service_target}"
+    log "Systemd unit: ${service_target}"
+}
+
+# Reproducible node_modules + refreshed unit + restart after toolkit pull (self-update) or manual repair.
+releasepanel_managed_agent_install_node_modules() {
+    local runner_dir="$1"
+    local npm_timeout="${RELEASEPANEL_NPM_TIMEOUT_SECONDS:-900}"
+
+    __releasepanel_npm() {
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${npm_timeout}" "$@"
+        else
+            "$@"
+        fi
+    }
+
+    trap 'unset -f __releasepanel_npm 2>/dev/null' RETURN
+
+    if ! (
+        cd "${runner_dir}" || exit 1
+        if [ -f package-lock.json ]; then
+            prefer_offline=(--prefer-offline)
+            attempt=1
+            while [ "${attempt}" -le 3 ]; do
+                if __releasepanel_npm npm ci --omit=dev --no-audit --no-fund "${prefer_offline[@]}"; then
+                    break
+                fi
+                if [ "${attempt}" -eq 3 ]; then
+                    warn "Managed deploy agent: npm ci failed after 3 attempts; falling back to npm install."
+                    __releasepanel_npm npm install --omit=dev --no-audit --no-fund || exit 1
+                    break
+                fi
+                warn "Managed deploy agent: npm ci failed (attempt ${attempt}/3); retrying..."
+                sleep $((attempt * 4))
+                attempt=$((attempt + 1))
+            done
+        else
+            __releasepanel_npm npm install --omit=dev --no-audit --no-fund || exit 1
+        fi
+    ); then
+        return 1
+    fi
+
+    if ! ( cd "${runner_dir}" && node --check server.js ); then
+        printf '%s\n' "[releasepanel] error: server.js syntax check failed (${runner_dir})." >&2
+        return 1
+    fi
+
+    if ! (
+        cd "${runner_dir}" || exit 1
+        node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));for(const d of Object.keys(p.dependencies||{})){require(d);}"
+    ); then
+        printf '%s\n' "[releasepanel] error: Managed deploy agent dependencies incomplete after npm install (${runner_dir}). Try: cd ${runner_dir} && npm ci --omit=dev" >&2
+        return 1
+    fi
+}
+
+releasepanel_refresh_managed_deploy_agent() {
+    case "${RELEASEPANEL_SKIP_MANAGED_AGENT_REFRESH:-false}" in
+        1 | true | TRUE | yes | YES)
+            log "Skipping managed deploy agent refresh (RELEASEPANEL_SKIP_MANAGED_AGENT_REFRESH=true)."
+            return 0
+            ;;
+    esac
+
+    local toolkit="${RELEASEPANEL_TOOLKIT_DIR:-/opt/releasepanel-deploy}"
+    local runner_dir
+    runner_dir="$(releasepanel_resolve_runner_directory)"
+
+    if [ ! -f "${runner_dir}/package.json" ]; then
+        warn "releasepanel_refresh_managed_deploy_agent: no package.json in ${runner_dir}; skip."
+        return 0
+    fi
+
+    log "Managed deploy agent: npm install, systemd unit, service restart (${runner_dir})."
+    releasepanel_managed_agent_install_node_modules "${runner_dir}" || {
+        warn "releasepanel_refresh_managed_deploy_agent: npm failed in ${runner_dir}."
+        return 1
+    }
+
+    if [ -f "${runner_dir}/.env" ]; then
+        chmod 600 "${runner_dir}/.env"
+    fi
+
+    releasepanel_write_managed_agent_systemd_unit "${runner_dir}" "${toolkit}" || return 1
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "releasepanel_refresh_managed_deploy_agent: systemctl missing; restart the agent manually."
+        return 0
+    fi
+
+    systemctl daemon-reload
+    systemctl enable managed-deploy-agent 2>/dev/null || true
+
+    if systemctl is-active --quiet managed-deploy-agent 2>/dev/null; then
+        systemctl restart managed-deploy-agent || warn "releasepanel_refresh_managed_deploy_agent: systemctl restart failed."
+        releasepanel_runner_probe_health "${runner_dir}" 25 || warn "releasepanel_refresh_managed_deploy_agent: runner /health probe failed; check journalctl."
+    fi
+}
+
+releasepanel_dotenv_get() {
+    local file="$1"
+    local key="$2"
+    local line
+    line="$(grep -E "^[[:space:]]*${key}=" "${file}" 2>/dev/null | head -1 || true)"
+    if [ -z "${line}" ]; then
+        return 1
+    fi
+    local val="${line#*=}"
+    val="${val#\"}"
+    val="${val%\"}"
+    val="${val#\'}"
+    val="${val%\'}"
+    val="$(printf '%s' "${val}" | tr -d '\r')"
+    printf '%s\n' "${val}"
+}
+
+# Probe loopback /health with API key until success or timeout (fresh VPS bootstrap guardrail).
+releasepanel_runner_probe_health() {
+    local runner_dir="$1"
+    local max_wait="${2:-45}"
+    local env_file="${runner_dir}/.env"
+    local key=""
+    local host="127.0.0.1"
+    local port="9000"
+    local elapsed=0
+
+    if [ ! -f "${env_file}" ]; then
+        printf '%s\n' "[releasepanel] error: runner .env missing (${env_file})." >&2
+        return 1
+    fi
+
+    key="$(releasepanel_dotenv_get "${env_file}" MANAGED_AGENT_RUNNER_KEY 2>/dev/null || true)"
+    if [ -z "${key}" ] || [ "${key}" = "CHANGE_ME" ]; then
+        key="$(releasepanel_dotenv_get "${env_file}" RELEASEPANEL_RUNNER_KEY 2>/dev/null || true)"
+    fi
+    if [ -z "${key}" ] || [ "${key}" = "CHANGE_ME" ]; then
+        printf '%s\n' "[releasepanel] error: runner API key missing or CHANGE_ME (${env_file})." >&2
+        return 1
+    fi
+
+    local rh rp
+    rh="$(releasepanel_dotenv_get "${env_file}" MANAGED_AGENT_RUNNER_HOST 2>/dev/null || true)"
+    if [ -z "${rh}" ]; then
+        rh="$(releasepanel_dotenv_get "${env_file}" RELEASEPANEL_RUNNER_HOST 2>/dev/null || true)"
+    fi
+    rp="$(releasepanel_dotenv_get "${env_file}" MANAGED_AGENT_RUNNER_PORT 2>/dev/null || true)"
+    if [ -z "${rp}" ]; then
+        rp="$(releasepanel_dotenv_get "${env_file}" RELEASEPANEL_RUNNER_PORT 2>/dev/null || true)"
+    fi
+    [ -n "${rh}" ] && host="${rh}"
+    [ -n "${rp}" ] && port="${rp}"
+    if [ "${host}" = "0.0.0.0" ]; then
+        host="127.0.0.1"
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "releasepanel_runner_probe_health: curl missing; skipping HTTP probe."
+        return 0
+    fi
+
+    while [ "${elapsed}" -lt "${max_wait}" ]; do
+        if systemctl is-active --quiet managed-deploy-agent 2>/dev/null; then
+            if curl -fsS --connect-timeout 2 --max-time 8 \
+                -H "X-Managed-Agent-Key: ${key}" \
+                "http://${host}:${port}/health" >/dev/null 2>&1; then
+                log "Managed deploy agent healthy (http://${host}:${port}/health)."
+                return 0
+            fi
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    printf '%s\n' "[releasepanel] error: managed-deploy-agent not healthy within ${max_wait}s." >&2
+    printf '%s\n' "[releasepanel] hint: journalctl -u managed-deploy-agent -n 80 --no-pager" >&2
+    printf '%s\n' "[releasepanel] hint: cd ${runner_dir} && sudo npm ci --omit=dev && sudo systemctl restart managed-deploy-agent" >&2
+    return 1
+}
+
+releasepanel_dotenv_set_key() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    RELEASEPANEL_DOTENV_PATH="${file}" \
+    RELEASEPANEL_DOTENV_KEY="${key}" \
+    RELEASEPANEL_DOTENV_VAL="${value}" \
+        python3 <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["RELEASEPANEL_DOTENV_PATH"])
+key = os.environ["RELEASEPANEL_DOTENV_KEY"]
+value = os.environ["RELEASEPANEL_DOTENV_VAL"]
+lines = path.read_text().splitlines()
+out = []
+seen = False
+prefix = key + "="
+for line in lines:
+    stripped = line.lstrip()
+    if stripped.startswith(prefix):
+        out.append(key + "=" + value)
+        seen = True
+    else:
+        out.append(line)
+if not seen:
+    out.append(key + "=" + value)
+path.write_text("\n".join(out).rstrip() + "\n")
+PY
+}
+
+# Node agent reads MANAGED_AGENT_RUNNER_KEY / RELEASEPANEL_RUNNER_KEY only from its own .env.
+# Laravel heal (sync-self-site) updates the DB but never rewrote runner/.env — drift causes 401 Unauthorized.
+releasepanel_align_host_runner_dotenv_with_shared_env() {
+    local shared_env="${RELEASEPANEL_SHARED}/.env"
+    local toolkit="${RELEASEPANEL_TOOLKIT_DIR}"
+    local runner_dir=""
+    local runner_env=""
+    local panel_key=""
+    local cur_m cur_l
+
+    if [ ! -f "${shared_env}" ]; then
+        warn "releasepanel_align_host_runner_dotenv: missing ${shared_env}"
+        return 0
+    fi
+
+    panel_key="$(releasepanel_dotenv_get "${shared_env}" RELEASEPANEL_RUNNER_KEY || true)"
+    if [ -z "${panel_key}" ]; then
+        warn "releasepanel_align_host_runner_dotenv: RELEASEPANEL_RUNNER_KEY is empty in ${shared_env}"
+        return 0
+    fi
+
+    if [ -f "${toolkit}/../server.js" ]; then
+        runner_dir="$(cd "${toolkit}/.." && pwd)"
+    else
+        runner_dir="${toolkit}/runner"
+    fi
+
+    runner_env="${runner_dir}/.env"
+    if [ ! -f "${runner_env}" ]; then
+        warn "releasepanel_align_host_runner_dotenv: missing ${runner_env} — run: sudo releasepanel runner"
+        return 0
+    fi
+
+    cur_m="$(releasepanel_dotenv_get "${runner_env}" MANAGED_AGENT_RUNNER_KEY || true)"
+    cur_l="$(releasepanel_dotenv_get "${runner_env}" RELEASEPANEL_RUNNER_KEY || true)"
+
+    if [ "${cur_m}" = "${panel_key}" ] && [ "${cur_l}" = "${panel_key}" ]; then
+        log "Host runner .env keys already match panel shared/.env (RELEASEPANEL_RUNNER_KEY)."
+        return 0
+    fi
+
+    log "Writing host runner ${runner_env} keys to match panel ${shared_env} (MANAGED_AGENT_* + RELEASEPANEL_*)."
+    releasepanel_dotenv_set_key "${runner_env}" MANAGED_AGENT_RUNNER_KEY "${panel_key}"
+    releasepanel_dotenv_set_key "${runner_env}" RELEASEPANEL_RUNNER_KEY "${panel_key}"
+    chmod 600 "${runner_env}"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        log "Restarting managed-deploy-agent to load the updated key."
+        systemctl restart managed-deploy-agent 2>/dev/null ||
+            warn "Could not restart managed-deploy-agent (install the unit or run the runner manually)."
+    fi
+}
+
 # Prune undecryptable servers rows, relink releasepanel-app to the host runner, refresh heartbeats.
 # Call load_env() first with the panel toolkit env (e.g. sites/releasepanel-app/production.env).
 releasepanel_heal_self_host_runner_credentials() {
@@ -524,6 +829,9 @@ releasepanel_heal_self_host_runner_credentials() {
 
     branch="${BRANCH:-main}"
 
+    log "Clearing Laravel config cache so releasepanel:sync-self-site reads current shared/.env."
+    run_as_app_user_in "${panel_live}" "$(php_binary)" artisan config:clear --no-interaction || return 1
+
     case "${RELEASEPANEL_SKIP_PRUNE_UNDECRYPTABLE_SERVERS:-false}" in
         1 | true | TRUE | yes | YES)
             log "Skipping releasepanel:prune-undecryptable-servers (RELEASEPANEL_SKIP_PRUNE_UNDECRYPTABLE_SERVERS=true)."
@@ -541,8 +849,15 @@ releasepanel_heal_self_host_runner_credentials() {
         --deploy-path="${BASE_PATH}" \
         --php="${PHP_VERSION}" || return 1
 
+    releasepanel_align_host_runner_dotenv_with_shared_env || true
+
     log "Refreshing server reachability (servers:heartbeat)."
     run_as_app_user_in "${panel_live}" "$(php_binary)" artisan servers:heartbeat --no-interaction || return 1
+
+    log "Rebuilding Laravel caches after heal."
+    run_as_app_user_in "${panel_live}" "$(php_binary)" artisan config:cache --no-interaction || warn "config:cache after heal failed."
+    run_as_app_user_in "${panel_live}" "$(php_binary)" artisan route:cache --no-interaction || true
+    run_as_app_user_in "${panel_live}" "$(php_binary)" artisan view:cache --no-interaction || true
 }
 
 releasepanel_composer_path() {
@@ -616,42 +931,42 @@ local_http_redirect_check() {
 local_https_check() {
     local strict="${1:-false}"
     local le_cert="/etc/letsencrypt/live/${RELEASEPANEL_SERVER_NAME}/fullchain.pem"
-    local self_cert="/etc/ssl/releasepanel/${RELEASEPANEL_SERVER_NAME}/fullchain.pem"
     local cert=""
     local health_path="${RELEASEPANEL_HEALTH_PATH:-/up}"
     local paths=("${health_path}" "/health" "/")
     local path
     local health_code
+    local last_code=""
+    local loop_ip
 
     if [ -f "${le_cert}" ]; then
         cert="${le_cert}"
-    elif [ -f "${self_cert}" ]; then
-        cert="${self_cert}"
-        echo "[info] Using self-signed certificate at ${self_cert} for HTTPS health check."
     fi
 
     if [ -z "${cert}" ] || [ ! -f "${cert}" ]; then
-        echo "[warning] No local TLS certificate (Let's Encrypt or /etc/ssl/releasepanel). APP_URL may still use HTTPS (edge TLS or certbot later). Verifying app over HTTP on loopback."
+        echo "[warning] No local Let's Encrypt certificate yet. Verifying app over HTTP on loopback."
         local_http_check "${strict}"
         return $?
     fi
 
     for path in "${paths[@]}"; do
         [ -z "${path}" ] && continue
-
-        health_code="$(curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 \
-            --resolve "${RELEASEPANEL_SERVER_NAME}:443:127.0.0.1" \
-            "https://${RELEASEPANEL_SERVER_NAME}${path}" || true)"
-
-        if [ "${health_code}" = "200" ] || [ "${health_code}" = "302" ]; then
-            return 0
-        fi
+        for loop_ip in 127.0.0.1 '[::1]'; do
+            health_code="$(curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 \
+                --resolve "${RELEASEPANEL_SERVER_NAME}:443:${loop_ip}" \
+                "https://${RELEASEPANEL_SERVER_NAME}${path}" 2>/dev/null || true)"
+            last_code="${health_code}"
+            if [ "${health_code}" = "200" ] || [ "${health_code}" = "302" ]; then
+                return 0
+            fi
+        done
     done
 
-    if [ "${health_code:-000}" = "000" ]; then
-        echo "[warning] HTTPS app health check did not connect."
+    if [ "${last_code:-000}" = "000" ]; then
+        echo "[warning] HTTPS app health check did not connect (tried 127.0.0.1 and ::1 on port 443)."
+        echo "[hint] Is nginx listening on 443? Run: ss -tlnp | grep ':443'  —  and: grep -n listen /etc/nginx/sites-enabled/*-https.conf"
     else
-        echo "[warning] HTTPS app health checks failed; last response was ${health_code}."
+        echo "[warning] HTTPS app health checks failed; last response was ${last_code}."
     fi
 
     [ "${strict}" = "true" ] && return 1
