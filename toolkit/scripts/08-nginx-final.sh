@@ -37,6 +37,34 @@ target="/etc/nginx/sites-available/${site_name}-https.conf"
 enabled="/etc/nginx/sites-enabled/${site_name}-https.conf"
 nginx_names="$(nginx_server_names)"
 
+releasepanel_clear_stale_nginx_symlinks() {
+    # site ssl runs 06-nginx-phase1 first, which enables *-acme.conf. The final *-https.conf
+    # already has a :80 server block (ACME + redirect). Leaving *-acme.conf enabled causes
+    # "conflicting server name ... on 0.0.0.0:80, ignored" and the wrong vhost may lose port 80.
+    rm -f "/etc/nginx/sites-enabled/${site_name}" \
+        "/etc/nginx/sites-enabled/${site_name}-acme.conf" \
+        "/etc/nginx/sites-enabled/${site_name}-ssl" \
+        "/etc/nginx/sites-enabled/${site_name}-redirect" \
+        "/etc/nginx/sites-enabled/${site_name}-http.conf" \
+        "/etc/nginx/sites-enabled/${site_name}-http-app.conf" \
+        /etc/nginx/sites-enabled/default \
+        /etc/nginx/sites-enabled/releasepanel-ssl \
+        /etc/nginx/sites-enabled/releasepanel-redirect \
+        /etc/nginx/sites-enabled/releasepanel-http.conf \
+        /etc/nginx/sites-enabled/releasepanel-https.conf
+}
+
+if [ -f "${target}" ] && grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "${target}"; then
+    log "Existing HTTPS nginx config already defines ssl_certificate; leaving ${target} unchanged."
+    releasepanel_clear_stale_nginx_symlinks
+    ln -sfn "${target}" "${enabled}"
+    validate_nginx_domain_file "${target}"
+    nginx -t
+    systemctl reload nginx
+    log "Reloaded nginx (existing SSL config preserved)."
+    exit 0
+fi
+
 log "Writing final HTTPS nginx config for ${RELEASEPANEL_SERVER_NAME}."
 sed \
     -e "s#__RELEASEPANEL_SERVER_NAME__#${RELEASEPANEL_SERVER_NAME}#g" \
@@ -53,17 +81,7 @@ if [ ! -f /etc/letsencrypt/ssl-dhparams.pem ]; then
     sed -i '/^[[:space:]]*ssl_dhparam[[:space:]]/d' "${target}"
 fi
 
-rm -f "/etc/nginx/sites-enabled/${site_name}" \
-    "/etc/nginx/sites-enabled/${site_name}-acme.conf" \
-    "/etc/nginx/sites-enabled/${site_name}-ssl" \
-    "/etc/nginx/sites-enabled/${site_name}-redirect" \
-    "/etc/nginx/sites-enabled/${site_name}-http.conf" \
-    "/etc/nginx/sites-enabled/${site_name}-http-app.conf" \
-    /etc/nginx/sites-enabled/default \
-    /etc/nginx/sites-enabled/releasepanel-ssl \
-    /etc/nginx/sites-enabled/releasepanel-redirect \
-    /etc/nginx/sites-enabled/releasepanel-http.conf \
-    /etc/nginx/sites-enabled/releasepanel-https.conf
+releasepanel_clear_stale_nginx_symlinks
 ln -sfn "${target}" "${enabled}"
 
 nginx -t
