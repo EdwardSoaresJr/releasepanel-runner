@@ -6,19 +6,6 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-install -d -m 0755 /etc/apt/apt.conf.d
-cat >/etc/apt/apt.conf.d/99releasepanel-optimizations <<'EOF'
-Acquire::ForceIPv4 "true";
-Acquire::Retries "2";
-Acquire::http::Timeout "10";
-Acquire::https::Timeout "10";
-Acquire::Queue-Mode "host";
-APT::Install-Recommends "0";
-APT::Install-Suggests "0";
-DPkg::Use-Pty "0";
-DPkg::Options { "--force-confdef"; "--force-confold"; };
-EOF
-
 if [[ ! -f /etc/os-release ]]; then
   echo "Missing /etc/os-release — unsupported OS." >&2
   exit 1
@@ -40,6 +27,19 @@ if [[ ! "${UBUNTU_CODENAME}" =~ ^(noble|oracular|questing)$ ]]; then
   echo "[provision] BYOS provision targets Ubuntu 24.04 LTS (noble). This release is: ${UBUNTU_CODENAME:-unknown}. Use a noble (or newer Ubuntu LTS) image." >&2
   exit 1
 fi
+
+# Shared apt optimizations: IPv4/retries, optional DigitalOcean mirrors, cache wipe (before first apt-get update below).
+_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-optimizations.sh"
+if [[ -f "${_lib}" ]]; then
+  # shellcheck source=/dev/null
+  source "${_lib}"
+fi
+command -v force_ipv4_apt >/dev/null 2>&1 || {
+  echo "[provision][warn] Missing scripts/lib/apt-optimizations.sh (expected ${_lib}); continuing with distro defaults." >&2
+}
+
+force_ipv4_apt || true
+force_fast_apt_mirrors || true
 
 strip_ondrej_launchpad_sources() {
   # PPA list files only; safe before software-properties-common is installed.
@@ -125,9 +125,7 @@ apt_get_update_retry() {
 
 strip_ondrej_launchpad_sources
 use_http_for_ubuntu_archive_urls
-echo "[provision] Cleaning apt cache (mirror sync safety)..."
-rm -rf /var/lib/apt/lists/*
-apt-get clean
+clean_apt_cache_safe || true
 
 apt_get_update_retry
 

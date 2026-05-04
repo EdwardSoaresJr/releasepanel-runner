@@ -37,6 +37,16 @@ install_base_packages() {
     case "${PM}" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
+            APT_OPT="${INSTALL_ROOT}/scripts/lib/apt-optimizations.sh"
+            if [ -r "${APT_OPT}" ]; then
+                # shellcheck source=/dev/null
+                . "${APT_OPT}"
+            fi
+            if command -v force_ipv4_apt >/dev/null 2>&1; then
+                force_ipv4_apt || true
+                force_fast_apt_mirrors || true
+                clean_apt_cache_safe || true
+            fi
             apt-get update -y
             apt-get install -y curl ca-certificates git python3
             ;;

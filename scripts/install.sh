@@ -20,6 +20,57 @@ log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Mirrors scripts/lib/apt-optimizations.sh (Ubuntu + DigitalOcean heuristic + IPv4 tuning).
+# Runs before the runner repo exists locally (bootstrap path).
+_rp_git_bootstrap_apt_prepare() {
+    echo "[apt] forcing IPv4"
+    install -d -m 0755 /etc/apt/apt.conf.d || true
+    cat >/etc/apt/apt.conf.d/99releasepanel-bootstrap.conf <<'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "2";
+Acquire::http::Timeout "10";
+Acquire::https::Timeout "10";
+EOF
+
+    local is_do=0
+    if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+        if hostname 2>/dev/null | grep -qi digitalocean; then
+            is_do=1
+        fi
+        if [ "${is_do}" -eq 0 ] && [ -f /etc/motd ] && grep -qi digitalocean /etc/motd 2>/dev/null; then
+            is_do=1
+        fi
+        if [ "${is_do}" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+            local droplet_id=""
+            droplet_id="$(curl -fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/metadata/v1/id 2>/dev/null || true)"
+            droplet_id="$(printf '%s' "${droplet_id}" | tr -cd '[:alnum:]')"
+            [ -n "${droplet_id}" ] && is_do=1
+        fi
+        if [ "${is_do}" -eq 1 ]; then
+            echo "[apt] enforcing fast mirrors"
+            if [ -f /etc/apt/sources.list ] && grep -qE '(archive|security)\.ubuntu\.com' /etc/apt/sources.list 2>/dev/null; then
+                sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' /etc/apt/sources.list
+            fi
+            local f
+            for f in /etc/apt/sources.list.d/*.sources; do
+                [ -f "${f}" ] || continue
+                if grep -qE '(archive|security)\.ubuntu\.com' "${f}" 2>/dev/null; then
+                    sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' "${f}"
+                fi
+            done
+            for f in /etc/apt/sources.list.d/ubuntu*.list /etc/apt/sources.list.d/*ubuntu*.list; do
+                [ -f "${f}" ] || continue
+                if grep -qE '(archive|security)\.ubuntu\.com' "${f}" 2>/dev/null; then
+                    sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' "${f}"
+                fi
+            done
+        fi
+    fi
+    echo "[apt] cleaning cache"
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean 2>/dev/null || true
+}
+
 usage() {
     cat >&2 <<'EOF'
 ReleasePanel bootstrap: clones releasepanel-runner, then installs the agent from the repo (single source of truth).
@@ -107,6 +158,7 @@ ensure_git() {
     log "Installing git…"
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
+        _rp_git_bootstrap_apt_prepare || true
         apt-get update -y
         apt-get install -y git ca-certificates
         return 0
