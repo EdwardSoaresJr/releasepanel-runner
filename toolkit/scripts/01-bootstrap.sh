@@ -95,6 +95,18 @@ PHP_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
 
 strip_ondrej_launchpad_sources || true
 
+# First apt update must use tuned mirrors (scripts/lib/apt-optimizations.sh).
+_RUNNER_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+APT_OPT="${_RUNNER_ROOT}/scripts/lib/apt-optimizations.sh"
+if [ -r "${APT_OPT}" ]; then
+    # shellcheck source=/dev/null
+    . "${APT_OPT}"
+    command -v force_ipv4_apt >/dev/null 2>&1 && force_ipv4_apt || true
+    command -v configure_apt_timeouts >/dev/null 2>&1 && configure_apt_timeouts || true
+    command -v apply_detected_mirror >/dev/null 2>&1 && apply_detected_mirror || true
+    command -v clean_apt_cache_safe >/dev/null 2>&1 && clean_apt_cache_safe || true
+fi
+
 apt_update_noninteractive
 apt_get_noninteractive upgrade -y
 

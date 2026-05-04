@@ -13,6 +13,8 @@ fail() {
     exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 apt_get_noninteractive() {
     apt-get \
         -o Acquire::Retries=3 \
@@ -93,6 +95,17 @@ if [ "${ID:-}" != "ubuntu" ] || [[ ! "${UBUNTU_CODENAME}" =~ ^(noble|oracular|qu
 fi
 
 strip_ondrej_launchpad_sources || true
+
+_RUNNER_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+APT_OPT="${_RUNNER_ROOT}/scripts/lib/apt-optimizations.sh"
+if [ -r "${APT_OPT}" ]; then
+    # shellcheck source=/dev/null
+    . "${APT_OPT}"
+    command -v force_ipv4_apt >/dev/null 2>&1 && force_ipv4_apt || true
+    command -v configure_apt_timeouts >/dev/null 2>&1 && configure_apt_timeouts || true
+    command -v apply_detected_mirror >/dev/null 2>&1 && apply_detected_mirror || true
+    command -v clean_apt_cache_safe >/dev/null 2>&1 && clean_apt_cache_safe || true
+fi
 
 apt_update_noninteractive
 apt_get_noninteractive install -y apt-transport-https ca-certificates curl dirmngr gnupg
