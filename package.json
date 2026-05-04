@@ -4,7 +4,8 @@
   "description": "On-server managed deploy agent (Node) used from deploy repo runner/",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check:site-setup-shell": "bash -n scripts/site/setup-laravel-site.sh"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
