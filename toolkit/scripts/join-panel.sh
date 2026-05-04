@@ -9,8 +9,41 @@ fail() {
     exit 1
 }
 
-panel_url="${1:-${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}}"
-[ -n "${panel_url}" ] || fail "Usage: managed-deploy join https://panel.example.com   (or set MANAGED_AGENT_PANEL_URL)"
+panel_url=""
+positional=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --panel-url=*)
+            panel_url="${1#*=}"
+            shift
+            ;;
+        --account-key=* | --install-key=*)
+            k="${1#*=}"
+            export MANAGED_AGENT_ACCOUNT_KEY="${k}"
+            export RELEASEPANEL_AGENT_ACCOUNT_KEY="${k}"
+            export MANAGED_AGENT_PANEL_INSTALL_KEY="${k}"
+            export RELEASEPANEL_INSTALL_KEY="${k}"
+            shift
+            ;;
+        -*)
+            fail "Unknown option: $1"
+            ;;
+        *)
+            if [ -n "${positional}" ]; then
+                fail "Unexpected argument: $1"
+            fi
+            positional="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "${panel_url}" ]; then
+    panel_url="${positional}"
+fi
+
+panel_url="${panel_url:-${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}}"
+[ -n "${panel_url}" ] || fail "Usage: managed-deploy join https://panel.example.com   (or MANAGED_AGENT_PANEL_URL / --panel-url=)"
 
 base="${panel_url%/}"
 check_url="${base}/api/runner-connectivity-check"

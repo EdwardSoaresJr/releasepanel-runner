@@ -41,7 +41,7 @@ if [ -z "${runner_key}" ] && [ -f "${RUNNER_ENV}" ]; then
 fi
 
 if [ -z "${runner_key}" ] || [ "${runner_key}" = "CHANGE_ME" ]; then
-    runner_key="$(openssl rand -hex 64)"
+    runner_key="$(openssl rand -hex 32)"
 fi
 
 # Self-signed HTTPS panel: only mirror join-panel auto-insecure when curl fails *certificate verification* (60/51),
@@ -199,7 +199,7 @@ body="$(cat "${tmp_body}")"
 if [ "${http_code}" = "409" ]; then
     if printf '%s' "${body}" | python3 -c "import json,sys; j=json.load(sys.stdin); raise SystemExit(0 if j.get('code')=='runner_key_host_mismatch' and j.get('regenerate_runner_key') else 1)" 2>/dev/null; then
         printf '%s\n' "[managed-deploy-agent] Runner key is already bound to another host; generating a fresh key on this VPS and retrying registration once." >&2
-        runner_key="$(openssl rand -hex 64)"
+        runner_key="$(openssl rand -hex 32)"
         upsert_env MANAGED_AGENT_RUNNER_KEY "${runner_key}"
         upsert_env RELEASEPANEL_RUNNER_KEY "${runner_key}"
         http_code="$(do_register "${runner_key}")"
