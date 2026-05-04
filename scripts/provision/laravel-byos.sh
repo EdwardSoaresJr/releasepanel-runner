@@ -126,7 +126,10 @@ else
   apt_update_safe
 
   php_candidate=""
-  php_candidate=$(apt-cache policy php8.3-cli 2>/dev/null | awk '/^  Candidate:/ {print $2; exit}')
+  php_candidate="$(
+    apt-cache policy php8.3-cli 2>/dev/null |
+      awk '/^  Candidate:/ {candidate=$2} END {print candidate}'
+  )"
   if [[ -z "${php_candidate}" || "${php_candidate}" == "(none)" ]]; then
     ensure_universe_enabled
     if [[ "${UNIVERSE_SOURCES_MODIFIED}" -eq 1 ]]; then
