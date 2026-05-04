@@ -37,30 +37,29 @@ apt_package_available() {
     apt-cache show "${package}" >/dev/null 2>&1
 }
 
-install_ondrej_php_repo() {
-    local keyring="/etc/apt/keyrings/ondrej-php.gpg"
-    local source_list="/etc/apt/sources.list.d/ondrej-php.list"
-    local key_id="14AA40EC0831756756D7F66C4F4EA0AAE5267A6C"
-    local ppa_url="${RELEASEPANEL_PHP_PPA_URL:-http://ppa.launchpad.net/ondrej/php/ubuntu}"
-    local codename
+strip_ondrej_launchpad_sources() {
+    local f
+    shopt -s nullglob
+    for f in \
+        /etc/apt/sources.list.d/*ondrej* \
+        /etc/apt/sources.list.d/*launchpadcontent_net_ondrej* \
+        /etc/apt/sources.list.d/*ppa.launchpadcontent.net_ondrej*; do
+        echo "[releasepanel] Removing stale apt source (Ondřej / Launchpad): ${f}"
+        rm -f "${f}"
+    done
+    shopt -u nullglob
+}
 
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    codename="${VERSION_CODENAME:-}"
-
-    [ -n "${codename}" ] || fail "Unable to detect Ubuntu codename from /etc/os-release"
-
-    install -d -m 0755 /etc/apt/keyrings
-
-    if [ ! -f "${keyring}" ]; then
-        gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "${key_id}"
-        gpg --batch --export "${key_id}" > "${keyring}"
-        chmod 644 "${keyring}"
+ensure_php_in_apt_ubuntu() {
+    local pkg="php${PHP_VERSION}"
+    if apt_package_available "${pkg}"; then
+        return 0
     fi
-
-    cat > "${source_list}" <<EOF
-deb [signed-by=${keyring}] ${ppa_url} ${codename} main
-EOF
+    echo "[releasepanel] ${pkg} not in apt indexes — enabling universe (native packages on Ubuntu noble+) ..."
+    apt_get_noninteractive install -y software-properties-common
+    add-apt-repository universe -y 2>/dev/null || true
+    apt_update_noninteractive
+    apt_package_available "${pkg}"
 }
 
 configure_php_fpm_pool() {
@@ -83,19 +82,24 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if ! printf '%s' "${PHP_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+$'; then
-    fail "Usage: ${0##*/} <php-version>  # example: ${0##*/} 8.4"
+    fail "Usage: ${0##*/} <php-version>  # example: ${0##*/} 8.3"
 fi
+
+# shellcheck disable=SC1091
+. /etc/os-release
+UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+if [ "${ID:-}" != "ubuntu" ] || [[ ! "${UBUNTU_CODENAME}" =~ ^(noble|oracular|questing)$ ]]; then
+    fail "This installer targets Ubuntu 24.04 LTS (noble) and newer Ubuntu LTS with distro PHP only. Found: ${ID:-?} ${UBUNTU_CODENAME:-?}. Use a noble image (no Ondřej PPA)."
+fi
+
+strip_ondrej_launchpad_sources || true
 
 apt_update_noninteractive
 apt_get_noninteractive install -y apt-transport-https ca-certificates curl dirmngr gnupg
 
-if ! apt_package_available "php${PHP_VERSION}"; then
-    echo "[releasepanel] PHP ${PHP_VERSION} is not available from current apt sources; adding Ondrej PHP repository."
-    install_ondrej_php_repo
-    apt_update_noninteractive
+if ! ensure_php_in_apt_ubuntu; then
+    fail "php${PHP_VERSION} is not available from Ubuntu archives. On noble, enable universe and use distro packages only (PHP 8.3 is default)."
 fi
-
-apt_package_available "php${PHP_VERSION}" || fail "php${PHP_VERSION} is not available from apt after repository setup."
 
 apt_get_noninteractive install -y \
     "php${PHP_VERSION}" \

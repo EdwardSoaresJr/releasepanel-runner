@@ -6,6 +6,15 @@ echo "[bootstrap] Starting system bootstrap..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck disable=SC1091
+. /etc/os-release || true
+UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+if [ "${ID:-}" != "ubuntu" ] || [[ ! "${UBUNTU_CODENAME}" =~ ^(noble|oracular|questing)$ ]]; then
+    echo "[bootstrap] This script targets Ubuntu 24.04 LTS (noble) with native PHP packages only."
+    echo "[bootstrap] Found: ID=${ID:-unknown} VERSION_CODENAME=${UBUNTU_CODENAME:-unknown} — use a noble (or newer supported Ubuntu) image."
+    exit 1
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
@@ -47,8 +56,7 @@ require_apt_package_available() {
     fi
 
     echo "[bootstrap] ERROR: ${package} is not available from apt."
-    echo "[bootstrap] The Ondrej PHP repository index did not load, so PHP ${PHP_VERSION} cannot be installed yet."
-    echo "[bootstrap] This is usually a temporary Launchpad/PPA network issue. Re-run: apt-get update && bash scripts/01-bootstrap.sh"
+    echo "[bootstrap] On Ubuntu noble, enable universe (sudo add-apt-repository universe) and run apt-get update."
     exit 1
 }
 
@@ -58,37 +66,34 @@ apt_package_available() {
     apt-cache show "${package}" >/dev/null 2>&1
 }
 
-install_ondrej_php_repo() {
-    local keyring="/etc/apt/keyrings/ondrej-php.gpg"
-    local source_list="/etc/apt/sources.list.d/ondrej-php.list"
-    local key_id="14AA40EC0831756756D7F66C4F4EA0AAE5267A6C"
-    local ppa_url="${RELEASEPANEL_PHP_PPA_URL:-http://ppa.launchpad.net/ondrej/php/ubuntu}"
-    local codename
+strip_ondrej_launchpad_sources() {
+    local f
+    shopt -s nullglob
+    for f in \
+        /etc/apt/sources.list.d/*ondrej* \
+        /etc/apt/sources.list.d/*launchpadcontent_net_ondrej* \
+        /etc/apt/sources.list.d/*ppa.launchpadcontent.net_ondrej*; do
+        echo "[bootstrap] Removing stale apt source (Ondřej / Launchpad): ${f}"
+        rm -f "${f}"
+    done
+    shopt -u nullglob
+}
 
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    codename="${VERSION_CODENAME:-}"
-
-    if [ -z "${codename}" ]; then
-        echo "[bootstrap] ERROR: Unable to detect Ubuntu codename from /etc/os-release"
-        exit 1
+ensure_php_available_native() {
+    if apt_package_available "php${PHP_VERSION}"; then
+        return 0
     fi
-
-    install -d -m 0755 /etc/apt/keyrings
-
-    if [ ! -f "${keyring}" ]; then
-        gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "${key_id}"
-        gpg --batch --export "${key_id}" > "${keyring}"
-        chmod 644 "${keyring}"
-    fi
-
-    cat > "${source_list}" <<EOF
-deb [signed-by=${keyring}] ${ppa_url} ${codename} main
-EOF
+    echo "[bootstrap] php${PHP_VERSION} not in apt indexes — enabling universe (minimal cloud images) ..."
+    apt_get_noninteractive install -y software-properties-common
+    add-apt-repository universe -y 2>/dev/null || true
+    apt_update_noninteractive || true
+    apt_package_available "php${PHP_VERSION}"
 }
 
 PHP_VERSION="${PHP_VERSION:-${RELEASEPANEL_PHP_VERSION:-8.3}}"
 PHP_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+
+strip_ondrej_launchpad_sources || true
 
 apt_update_noninteractive
 apt_get_noninteractive upgrade -y
@@ -105,6 +110,7 @@ apt_get_noninteractive install -y \
     nginx \
     python3-certbot-nginx \
     redis-server \
+    software-properties-common \
     supervisor \
     unzip \
     zip
@@ -119,24 +125,17 @@ if ! command -v npm >/dev/null 2>&1; then
     apt_get_noninteractive install -y npm
 fi
 
-if ! apt_package_available "php${PHP_VERSION}"; then
-    echo "[bootstrap] PHP ${PHP_VERSION} is not available from current apt sources; adding Ondrej PHP repository."
-    install_ondrej_php_repo
-    apt_update_noninteractive || true
-fi
-
 if ! apt_package_available "php${PHP_VERSION}" && [ "${PHP_VERSION}" != "8.3" ]; then
     echo "[bootstrap] php${PHP_VERSION} unavailable; falling back to 8.3."
     PHP_VERSION="8.3"
     PHP_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
 fi
 
-if apt_package_available "php${PHP_VERSION}"; then
+if ensure_php_available_native; then
     echo "[bootstrap] PHP ${PHP_VERSION} is available from apt."
 else
-    echo "[bootstrap] PHP ${PHP_VERSION} is not available from current apt sources; retrying Ondrej PHP repository."
-    install_ondrej_php_repo
-    apt_update_noninteractive || true
+    echo "[bootstrap] php${PHP_VERSION} still not available after enabling universe — use Ubuntu noble with native PHP 8.3."
+    exit 1
 fi
 require_apt_package_available "php${PHP_VERSION}"
 
@@ -172,9 +171,7 @@ sed -i -E \
     "${pool_conf}"
 
 if ! command -v composer >/dev/null 2>&1; then
-    curl -sS https://getcomposer.org/installer | php
-    mv composer.phar /usr/local/bin/composer
-    chmod 755 /usr/local/bin/composer
+    apt_get_noninteractive install -y composer
 fi
 
 systemctl enable nginx
