@@ -98,8 +98,11 @@ case "${poll_raw}" in
         ;;
 esac
 
-write_env_after_success() {
+# reg_complete: 1 = final env after POST /api/register-runner (strip install key); 0 = staging so a
+# concurrently running agent can heartbeat-bootstrap with the install key before curl returns.
+write_runner_env() {
     local rk="$1"
+    local reg_complete="$2"
     local tmp
     tmp="$(mktemp)"
     chmod 600 "${tmp}" 2>/dev/null || true
@@ -131,26 +134,36 @@ write_env_after_success() {
             printf 'MANAGED_AGENT_POLL_ENABLED=false\n'
             printf 'RELEASEPANEL_POLL_ENABLED=false\n'
         fi
-        printf 'MANAGED_AGENT_REGISTRATION_COMPLETE=1\n'
-        printf 'RELEASEPANEL_REGISTRATION_COMPLETE=1\n'
+        if [ "${reg_complete}" = "1" ]; then
+            printf 'MANAGED_AGENT_REGISTRATION_COMPLETE=1\n'
+            printf 'RELEASEPANEL_REGISTRATION_COMPLETE=1\n'
+        else
+            printf 'MANAGED_AGENT_REGISTRATION_COMPLETE=0\n'
+            printf 'RELEASEPANEL_REGISTRATION_COMPLETE=0\n'
+        fi
         case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
             1 | true | TRUE | yes | YES | on | ON)
                 printf 'MANAGED_AGENT_PANEL_INSECURE_TLS=1\n'
                 printf 'RELEASEPANEL_PANEL_INSECURE_TLS=1\n'
                 ;;
         esac
+        if [ "${reg_complete}" != "1" ] && [ -n "${panel_install_key}" ]; then
+            printf 'MANAGED_AGENT_ACCOUNT_KEY=%s\n' "${panel_install_key}"
+            printf 'RELEASEPANEL_PANEL_INSTALL_KEY=%s\n' "${panel_install_key}"
+        fi
     } > "${tmp}"
     mv -f "${tmp}" "${RUNNER_ENV}"
     chmod 600 "${RUNNER_ENV}"
 
-    # Remove legacy onboarding secrets if a backup or merge left them (never persist account key).
-    sed -i \
-        -e '/^MANAGED_AGENT_ACCOUNT_KEY=/d' \
-        -e '/^RELEASEPANEL_AGENT_ACCOUNT_KEY=/d' \
-        -e '/^MANAGED_AGENT_PANEL_INSTALL_KEY=/d' \
-        -e '/^RELEASEPANEL_INSTALL_KEY=/d' \
-        -e '/^RELEASEPANEL_PANEL_INSTALL_KEY=/d' \
-        "${RUNNER_ENV}" 2>/dev/null || true
+    if [ "${reg_complete}" = "1" ]; then
+        sed -i \
+            -e '/^MANAGED_AGENT_ACCOUNT_KEY=/d' \
+            -e '/^RELEASEPANEL_AGENT_ACCOUNT_KEY=/d' \
+            -e '/^MANAGED_AGENT_PANEL_INSTALL_KEY=/d' \
+            -e '/^RELEASEPANEL_INSTALL_KEY=/d' \
+            -e '/^RELEASEPANEL_PANEL_INSTALL_KEY=/d' \
+            "${RUNNER_ENV}" 2>/dev/null || true
+    fi
 }
 
 payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"runner_url":%s,"server_id":%s}' \
@@ -166,7 +179,9 @@ case "${runner_url}" in
         ;;
 esac
 
-printf '%s\n' "[managed-deploy-agent] Registering with control plane (agent .env is written only after success)…"
+write_runner_env "${runner_key}" 0
+
+printf '%s\n' "[managed-deploy-agent] Registering with control plane (staging ${RUNNER_ENV} with REGISTRATION_COMPLETE=0 so a running agent can heartbeat during join)…"
 
 reg_hdrs=()
 case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
@@ -207,6 +222,7 @@ if [ "${http_code}" = "409" ]; then
     if printf '%s' "${body}" | python3 -c "import json,sys; j=json.load(sys.stdin); raise SystemExit(0 if j.get('code')=='runner_key_host_mismatch' and j.get('regenerate_runner_key') else 1)" 2>/dev/null; then
         printf '%s\n' "[managed-deploy-agent] Runner key is already bound to another host; generating a fresh key on this VPS and retrying registration once." >&2
         runner_key="$(openssl rand -hex 32)"
+        write_runner_env "${runner_key}" 0
         http_code="$(do_register "${runner_key}")"
         body="$(cat "${tmp_body}")"
     fi
@@ -215,7 +231,7 @@ fi
 case "${http_code}" in
     2[0-9][0-9])
         printf '%s\n' "${body}"
-        write_env_after_success "${runner_key}"
+        write_runner_env "${runner_key}" 1
         printf '%s\n' "[managed-deploy-agent] Wrote ${RUNNER_ENV} and registration complete."
         ;;
     *)

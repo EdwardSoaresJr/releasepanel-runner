@@ -106,6 +106,28 @@ function envTruthy(primary, legacy) {
  return v === '1' || v === 'true' || v === 'TRUE' || v === 'yes' || v === 'YES' || v === 'on' || v === 'ON';
 }
 
+/** Install key for onboarding only; register-server.sh may stage it until REGISTRATION_COMPLETE=1. */
+function envOnboardingInstallKey() {
+    const keys = [
+        'MANAGED_AGENT_ACCOUNT_KEY',
+        'RELEASEPANEL_AGENT_ACCOUNT_KEY',
+        'MANAGED_AGENT_PANEL_INSTALL_KEY',
+        'RELEASEPANEL_INSTALL_KEY',
+        'RELEASEPANEL_PANEL_INSTALL_KEY',
+    ];
+    for (const k of keys) {
+        const v = process.env[k];
+        if (v !== undefined && String(v).trim() !== '') {
+            return String(v).trim();
+        }
+    }
+    return '';
+}
+
+function registrationComplete() {
+    return envTruthy('MANAGED_AGENT_REGISTRATION_COMPLETE', 'RELEASEPANEL_REGISTRATION_COMPLETE');
+}
+
 /** When unset, default poll on if a panel URL is configured (hosted / NAT installs). Opt out: MANAGED_AGENT_POLL_ENABLED=false */
 function envPollEnabled(panelUrlNormalized) {
  const raw = process.env.MANAGED_AGENT_POLL_ENABLED || process.env.RELEASEPANEL_POLL_ENABLED;
@@ -387,6 +409,15 @@ async function panelFetchJson(pathname, { method = 'POST', bodyObj = {} } = {}) 
         'X-RUNNER-KEY': apiKey,
         ...sig,
     };
+    const onboard = envOnboardingInstallKey();
+    if (
+        onboard
+        && !registrationComplete()
+        && (pathname === '/api/runner-heartbeat' || pathname === '/api/register-runner')
+    ) {
+        initHeaders['X-ACCOUNT-INSTALL-KEY'] = onboard;
+        initHeaders['X-RELEASEPANEL-INSTALL-KEY'] = onboard;
+    }
     // Account install key is for registration / heartbeat bootstrap only (join-panel + register-server.sh).
     // Heartbeats, poll, and job-result authenticate with X-RUNNER-KEY; signatures add replay/tamper resistance when the panel enforces them.
 
