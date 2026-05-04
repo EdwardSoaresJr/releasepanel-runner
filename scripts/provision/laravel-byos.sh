@@ -28,7 +28,7 @@ if [[ ! "${UBUNTU_CODENAME}" =~ ^(noble|oracular|questing)$ ]]; then
   exit 1
 fi
 
-# Shared apt optimizations: IPv4/retries, optional DigitalOcean mirrors, cache wipe (before first apt-get update below).
+# Shared apt optimizations (scripts/lib): IPv4, timeouts, mirror probe, safe apt update.
 _lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-optimizations.sh"
 if [[ -f "${_lib}" ]]; then
   # shellcheck source=/dev/null
@@ -39,7 +39,7 @@ command -v force_ipv4_apt >/dev/null 2>&1 || {
 }
 
 force_ipv4_apt || true
-force_fast_apt_mirrors || true
+ensure_apt_acquire_timeouts || true
 
 strip_ondrej_launchpad_sources() {
   # PPA list files only; safe before software-properties-common is installed.
@@ -106,28 +106,14 @@ ensure_universe_enabled() {
   UNIVERSE_SOURCES_MODIFIED=1
 }
 
-apt_get_update_retry() {
-  echo "[provision] Updating apt indexes (retry safe)..."
-  local i
-  for i in 1 2 3; do
-    if apt-get update -y; then
-      if [[ "${i}" -gt 1 ]]; then
-        echo "[provision] apt recovered after ${i} attempts"
-      fi
-      return 0
-    fi
-    echo "[provision] apt update failed (attempt ${i}), retrying..."
-    sleep 3
-  done
-  echo "[provision] ERROR: apt-get update failed after 3 attempts." >&2
-  return 1
-}
-
 strip_ondrej_launchpad_sources
 use_http_for_ubuntu_archive_urls
+
+export APT_UPDATE_SAFE_LOG_PROVISION=1
+apply_detected_mirror || true
 clean_apt_cache_safe || true
 
-apt_get_update_retry
+apt_update_safe
 
 php_candidate=""
 php_candidate=$(apt-cache policy php8.3-cli 2>/dev/null | awk '/^  Candidate:/ {print $2; exit}')
@@ -135,7 +121,7 @@ if [[ -z "${php_candidate}" || "${php_candidate}" == "(none)" ]]; then
   ensure_universe_enabled
   if [[ "${UNIVERSE_SOURCES_MODIFIED}" -eq 1 ]]; then
     echo "[provision] Refreshing apt indexes after enabling universe ..."
-    apt_get_update_retry
+    apt_update_safe
   fi
 fi
 

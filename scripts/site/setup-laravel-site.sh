@@ -164,10 +164,14 @@ if [ "$ENABLE_QUEUE" = true ]; then
           # shellcheck source=/dev/null
           . "${_lib}"
           command -v force_ipv4_apt >/dev/null 2>&1 && force_ipv4_apt || true
-          command -v force_fast_apt_mirrors >/dev/null 2>&1 && force_fast_apt_mirrors || true
+          command -v ensure_apt_acquire_timeouts >/dev/null 2>&1 && ensure_apt_acquire_timeouts || true
+          unset APT_UPDATE_SAFE_LOG_PROVISION
+          command -v apply_detected_mirror >/dev/null 2>&1 && apply_detected_mirror || true
           command -v clean_apt_cache_safe >/dev/null 2>&1 && clean_apt_cache_safe || true
+          command -v apt_update_safe >/dev/null 2>&1 && apt_update_safe || true
+        else
+          apt-get update -y || true
         fi
-        apt-get update -y
       fi
       apt-get install -y --no-install-recommends supervisor
     fi
