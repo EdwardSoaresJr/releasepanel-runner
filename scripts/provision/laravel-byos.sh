@@ -4,8 +4,12 @@
 # The panel reads this file from the runner checkout on the control plane and sends it as the agent provision payload.
 #
 set -euo pipefail
+set -x
 export DEBIAN_FRONTEND=noninteractive
 
+trap 'status=$?; echo "[provision] FAILED at line ${LINENO} (exit ${status}): ${BASH_COMMAND}" >&2' ERR
+
+echo "[provision] Validating operating system..."
 if [[ ! -f /etc/os-release ]]; then
   echo "Missing /etc/os-release — unsupported OS." >&2
   exit 1
@@ -103,9 +107,11 @@ ensure_universe_enabled() {
   UNIVERSE_SOURCES_MODIFIED=1
 }
 
+echo "[provision] Preparing apt sources (PPA cleanup, archive URL tuning)..."
 strip_ondrej_launchpad_sources
 use_http_for_ubuntu_archive_urls
 
+echo "[provision] Tuning apt (IPv4, timeouts, mirror)..."
 force_ipv4_apt || true
 configure_apt_timeouts || true
 apply_detected_mirror || true
@@ -113,6 +119,7 @@ apply_detected_mirror || true
 if releasepanel_base_image_ready; then
   echo "[provision] ReleasePanel base image detected — skipping package installation."
 else
+  echo "[provision] Updating apt indexes..."
   clean_apt_cache_safe || true
   apt_update_safe
 
@@ -149,16 +156,16 @@ else
     pkgs+=(composer)
   fi
 
-  echo "[provision] Installing packages (prefetch + install)..."
+  echo "[provision] Installing packages..."
   apt_prefetch_packages "${pkgs[@]}"
   apt_install_packages "${pkgs[@]}"
   releasepanel_write_base_image_marker || true
 fi
 
+echo "[provision] Creating deploy user..."
 if id -u deploy >/dev/null 2>&1; then
   echo "[provision] User deploy already exists."
 else
-  echo "[provision] Creating deploy user..."
   useradd -m -s /bin/bash deploy
 fi
 
@@ -170,6 +177,7 @@ echo "[provision] Preparing /var/www ..."
 mkdir -p /var/www
 chown deploy:deploy /var/www || true
 
+echo "[provision] Configuring services..."
 echo "[provision] Configuring nginx default site..."
 rm -f /etc/nginx/sites-enabled/default || true
 
