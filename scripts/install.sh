@@ -219,6 +219,10 @@ main() {
     fi
     export NON_INTERACTIVE
 
+    if [ "${NON_INTERACTIVE}" -eq 1 ] && [ -z "${INSTALL_KEY}" ]; then
+        warn "No --account-key= set. If this panel requires an organization install key (SaaS), registration will fail until you add: --account-key='<from Settings>' — copy the full one-liner from Connect server."
+    fi
+
     log "Starting in-repo installer…"
     exec bash "${inner}"
 }
