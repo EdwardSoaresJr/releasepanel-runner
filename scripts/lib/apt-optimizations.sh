@@ -27,10 +27,9 @@ _rp_apt_runner_git_short() {
   printf 'unknown'
 }
 
-# Logs to stderr. Prints mirror BASE URI on stdout only (example: http://mirrors.digitalocean.com/ubuntu).
-detect_fast_apt_mirror() {
-  echo "[apt] detecting fast mirror" >&2
-
+# Informational lines go to stdout (panel UI "Output").
+# For subshell capture of the mirror URI only, use _rp_apt_resolve_fast_mirror_base().
+_rp_apt_resolve_fast_mirror_base() {
   local timeout=2
   local codename
   codename="$(_rp_apt_ubuntu_codename)"
@@ -48,7 +47,14 @@ detect_fast_apt_mirror() {
     fi
   fi
 
-  echo "[apt] selected mirror: ${selected}" >&2
+  printf '%s' "${selected}"
+}
+
+detect_fast_apt_mirror() {
+  echo "[apt] detecting fast mirror"
+  local selected
+  selected="$(_rp_apt_resolve_fast_mirror_base)"
+  echo "[apt] selected mirror: ${selected}"
   printf '%s' "${selected}"
 }
 
@@ -63,7 +69,12 @@ _rp_apt_sources_file_is_third_party() {
 
 _rp_apt_file_needs_mirror_rewrite() {
   local f="$1"
-  grep -qiE '(http|https)://archive\.ubuntu\.com/ubuntu|(http|https)://security\.ubuntu\.com/ubuntu|(http|https)://[a-z0-9.-]+\.clouds\.archive\.ubuntu\.com/ubuntu' "${f}" 2>/dev/null
+
+  if grep -qiE '(http|https)://archive\.ubuntu\.com/ubuntu|(http|https)://security\.ubuntu\.com/ubuntu|(http|https)://[a-z0-9.-]+\.clouds\.archive\.ubuntu\.com/ubuntu' "${f}" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
 }
 
 _rp_apt_apply_mirror_one_file() {
@@ -81,6 +92,8 @@ _rp_apt_apply_mirror_one_file() {
     return 0
   fi
 
+  echo "[apt] applying mirror to ${path}"
+
   sed -E -i \
     -e "s|https?://archive\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
     -e "s|https?://security\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
@@ -93,8 +106,10 @@ apply_detected_mirror() {
   grep -qi ubuntu /etc/os-release 2>/dev/null || return 0
 
   local mirror_base=""
-  mirror_base="$(detect_fast_apt_mirror)"
+  echo "[apt] detecting fast mirror"
+  mirror_base="$(_rp_apt_resolve_fast_mirror_base)"
   mirror_base="$(printf '%s' "${mirror_base}" | tr -d '\r\n')"
+  echo "[apt] selected mirror: ${mirror_base}"
   [[ -n "${mirror_base}" ]] || mirror_base="http://archive.ubuntu.com/ubuntu"
 
   if [[ -f /etc/apt/sources.list ]]; then

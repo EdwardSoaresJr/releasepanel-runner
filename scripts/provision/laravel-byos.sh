@@ -4,10 +4,12 @@
 # The panel reads this file from the runner checkout on the control plane and sends it as the agent provision payload.
 #
 set -euo pipefail
-set -x
-export DEBIAN_FRONTEND=noninteractive
-
+if [[ "${RELEASEPANEL_PROVISION_DEBUG:-0}" == "1" ]]; then
+  set -x
+fi
 trap 'status=$?; echo "[provision] FAILED at line ${LINENO} (exit ${status}): ${BASH_COMMAND}" >&2' ERR
+
+export DEBIAN_FRONTEND=noninteractive
 
 echo "[provision] Validating operating system..."
 if [[ ! -f /etc/os-release ]]; then
@@ -107,11 +109,11 @@ ensure_universe_enabled() {
   UNIVERSE_SOURCES_MODIFIED=1
 }
 
-echo "[provision] Preparing apt sources (PPA cleanup, archive URL tuning)..."
+echo "[provision] Preparing apt sources..."
 strip_ondrej_launchpad_sources
 use_http_for_ubuntu_archive_urls
 
-echo "[provision] Tuning apt (IPv4, timeouts, mirror)..."
+echo "[provision] Tuning apt..."
 force_ipv4_apt || true
 configure_apt_timeouts || true
 apply_detected_mirror || true
