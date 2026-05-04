@@ -3,7 +3,8 @@
 # Stable URL: https://YOUR_PANEL/install.sh  — all logic lives in toolkit/scripts/install-agent-from-repo.sh
 #
 #   curl -fsSL --proto '=https' --tlsv1.2 'https://YOUR_PANEL/install.sh' | sudo bash -s -- \
-#     --non-interactive --panel-url='https://YOUR_PANEL' [--account-key='…']
+#     --panel-url='https://YOUR_PANEL' \
+#     --account-key='acct_…'
 set -Eeuo pipefail
 
 readonly INSTALL_ROOT="${MANAGED_AGENT_INSTALL_ROOT:-/opt/managed-deploy-agent}"
@@ -24,20 +25,21 @@ usage() {
 ReleasePanel bootstrap: clones releasepanel-runner, then installs the agent from the repo (single source of truth).
 
 Usage:
-  curl -fsSL --proto '=https' --tlsv1.2 'https://YOUR_PANEL/install.sh' | sudo bash -s -- \
-    --non-interactive --panel-url='https://YOUR_PANEL'
+  curl -fsSL --proto '=https' --tlsv1.2 'https://YOUR_PANEL/install.sh' | sudo bash -s -- \\
+    --panel-url='https://YOUR_PANEL' \\
+    --account-key='acct_…'
 
 Options:
   --panel-url=URL       Control plane base URL (required for new installs)
-  --account-key=SECRET  SaaS onboarding (X-ACCOUNT-INSTALL-KEY); not kept in agent .env after register
+  --account-key=SECRET  Organization install key (X-ACCOUNT-INSTALL-KEY); not kept in agent .env after register
   --install-key=SECRET  Alias for --account-key
   --non-interactive     Fail if panel URL missing when needed
   --ssh-only            Skip agent; print SSH-only hints
   --agent               Install agent (default)
   --help
 
-Runner key is generated on the server (register-server.sh); do not pass --runner-key for normal onboarding.
-Override clone URL: MANAGED_AGENT_REPO_URL or RELEASEPANEL_RUNNER_REPO (default: public HTTPS GitHub).
+Runner key is generated on the VPS (register-server.sh) — never pass --runner-key here.
+Optional: --non-interactive for scripted installs. Override clone URL: MANAGED_AGENT_REPO_URL or RELEASEPANEL_RUNNER_REPO (default: public HTTPS GitHub).
 EOF
 }
 
@@ -219,8 +221,8 @@ main() {
     fi
     export NON_INTERACTIVE
 
-    if [ "${NON_INTERACTIVE}" -eq 1 ] && [ -z "${INSTALL_KEY}" ]; then
-        warn "No --account-key= set. If this panel requires an organization install key (SaaS), registration will fail until you add: --account-key='<from Settings>' — copy the full one-liner from Connect server."
+    if [ -z "${INSTALL_KEY}" ]; then
+        warn "No --account-key= set. If this panel requires an organization install key, registration will fail until you add it (copy the full command from Connect server in the panel)."
     fi
 
     log "Starting in-repo installer…"

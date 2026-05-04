@@ -208,6 +208,8 @@ main() {
         export RELEASEPANEL_INSTALL_KEY="${INSTALL_KEY}"
     fi
     if [ "${SKIP_JOIN}" -eq 0 ]; then
+        # Initial onboarding: leave runner key empty so register-server.sh generates one. Do not pass
+        # MANAGED_AGENT_RUNNER_KEY / --runner-key from the panel one-liner.
         export MANAGED_AGENT_RUNNER_KEY="${RUNNER_KEY}"
         export RELEASEPANEL_RUNNER_KEY="${RUNNER_KEY}"
     fi
