@@ -182,6 +182,12 @@ echo "[provision] Preparing /var/www ..."
 mkdir -p /var/www
 chown deploy:deploy /var/www || true
 
+echo "[provision] Preparing /var/www/sites (managed Laravel site roots) ..."
+mkdir -p /var/www/sites
+chown deploy:www-data /var/www/sites
+chmod 2775 /var/www/sites
+echo "[provision] /var/www/sites → deploy:www-data mode 2775 (deploy + www-data group can create site directories; fixes panel mkdir / toolkit sync when PHP runs as www-data)."
+
 echo "[provision] Configuring services..."
 echo "[provision] Configuring nginx default site..."
 rm -f /etc/nginx/sites-enabled/default || true
