@@ -78,6 +78,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const os = require('os');
 const https = require('https');
+const crypto = require('crypto');
 const { URL } = require('url');
 const { spawn, spawnSync } = require('child_process');
 
@@ -363,52 +364,31 @@ function healthContract() {
     };
 }
 
-function postHeartbeatRequest(targetUrl, init) {
-    if (!(panelInsecureTls && targetUrl.startsWith('https:'))) {
-        return fetch(targetUrl, init);
-    }
-
-    const u = new URL(targetUrl);
-    const body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body ?? '');
-    const headers = {
-        ...init.headers,
-        'Content-Length': Buffer.byteLength(body),
+/**
+ * Panel request signing (optional on panel via RELEASEPANEL_REQUIRE_RUNNER_REQUEST_SIGNATURE).
+ * Canonical string: `${unixSeconds}\n${rawBody}` — HMAC-SHA256 keyed by runner key, hex digest.
+ */
+function runnerRequestSignatureHeaders(runnerKey, rawBody) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.createHmac('sha256', runnerKey).update(`${ts}\n${rawBody}`).digest('hex');
+    return {
+        'X-Runner-Timestamp': ts,
+        'X-Runner-Signature': sig,
     };
-
-    return new Promise((resolve, reject) => {
-        const req = https.request(
-            {
-                hostname: u.hostname,
-                port: u.port || 443,
-                path: `${u.pathname}${u.search}`,
-                method: init.method || 'POST',
-                headers,
-                rejectUnauthorized: false,
-            },
-            (res) => {
-                res.resume();
-                res.on('end', () => {
-                    resolve({
-                        ok: res.statusCode >= 200 && res.statusCode < 300,
-                        status: res.statusCode,
-                    });
-                });
-            },
-        );
-        req.on('error', reject);
-        req.write(body);
-        req.end();
-    });
 }
 
 async function panelFetchJson(pathname, { method = 'POST', bodyObj = {} } = {}) {
     const targetUrl = `${panelUrl}${pathname}`;
     const bodyStr = JSON.stringify(bodyObj ?? {});
+    const sig = apiKey ? runnerRequestSignatureHeaders(apiKey, bodyStr) : {};
     const initHeaders = {
         Accept: 'application/json',
         'Content-Type': 'application/json',
         'X-RUNNER-KEY': apiKey,
+        ...sig,
     };
+    // Account install key is for registration / heartbeat bootstrap only (join-panel + register-server.sh).
+    // Heartbeats, poll, and job-result authenticate with X-RUNNER-KEY; signatures add replay/tamper resistance when the panel enforces them.
 
     if (!(panelInsecureTls && targetUrl.startsWith('https:'))) {
         const res = await fetch(targetUrl, { method, headers: initHeaders, body: bodyStr });
@@ -485,22 +465,23 @@ async function sendHeartbeat() {
             heartbeatPayload.name = displayName;
         }
 
-        const fetchInit = {
+        const response = await panelFetchJson('/api/runner-heartbeat', {
             method: 'POST',
-            headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-                'X-RUNNER-KEY': apiKey,
-            },
-            body: JSON.stringify(heartbeatPayload),
-        };
-        const response = await postHeartbeatRequest(`${panelUrl}/api/runner-heartbeat`, fetchInit);
+            bodyObj: heartbeatPayload,
+        });
 
         appendLog({
             event: 'heartbeat',
             action: 'heartbeat',
             success: response.ok,
             status_code: response.status,
+            ...(response.ok
+                ? {}
+                : {
+                      auth_code: response.json?.code ?? null,
+                      message: response.json?.message ?? null,
+                      hint: response.json?.hint ?? null,
+                  }),
         });
     } catch (error) {
         appendLog({
@@ -2439,6 +2420,13 @@ async function reportAgentJobResult(jobId, status, result, errorMessage) {
             status,
             http_ok: res.ok,
             http_status: res.status,
+            ...(!res.ok && (res.status === 401 || res.status === 403)
+                ? {
+                      auth_code: res.json?.code ?? null,
+                      message: res.json?.message ?? null,
+                      hint: res.json?.hint ?? null,
+                  }
+                : {}),
         });
     } catch (err) {
         appendLog({
@@ -2870,6 +2858,15 @@ async function runAgentPollCycle() {
             http_status: res.status,
         });
         if (!res.ok || !res.json || !res.json.job) {
+            if (!res.ok && (res.status === 401 || res.status === 403)) {
+                appendLog({
+                    event: 'agent_poll_auth_rejected',
+                    http_status: res.status,
+                    code: res.json?.code ?? null,
+                    message: res.json?.message ?? null,
+                    hint: res.json?.hint ?? null,
+                });
+            }
             return;
         }
         const job = res.json.job;

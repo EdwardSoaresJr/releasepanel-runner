@@ -2,8 +2,8 @@
 # ReleasePanel one-liner bootstrap: install managed-deploy-agent only (no nginx/php/prepare/site).
 # Usage (strict HTTPS fetch — public raw URL from releasepanel-runner by default):
 #   curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/EdwardSoaresJr/releasepanel-runner/main/scripts/install.sh' | sudo bash -s -- \
-#     --non-interactive --panel-url='https://YOUR_PANEL' --runner-key='SECRET'
-# Env (alternative to flags): MANAGED_AGENT_PANEL_URL, MANAGED_AGENT_RUNNER_KEY
+#     --non-interactive --panel-url='https://YOUR_PANEL'
+# Optional: --runner-key= (omit to auto-generate). Optional: --account-key= / MANAGED_AGENT_ACCOUNT_KEY (SaaS onboarding). Legacy aliases: --install-key / MANAGED_AGENT_PANEL_INSTALL_KEY.
 set -Eeuo pipefail
 
 readonly INSTALL_ROOT="${MANAGED_AGENT_INSTALL_ROOT:-/opt/managed-deploy-agent}"
@@ -12,6 +12,7 @@ readonly DEFAULT_BRANCH="${MANAGED_AGENT_REPO_BRANCH:-${RELEASEPANEL_RUNNER_BRAN
 
 PANEL_URL="${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}"
 RUNNER_KEY="${MANAGED_AGENT_RUNNER_KEY:-${RELEASEPANEL_RUNNER_KEY:-}}"
+INSTALL_KEY="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-}}}}"
 INSTALL_AGENT=1
 NON_INTERACTIVE=0
 
@@ -24,17 +25,20 @@ usage() {
 ReleasePanel agent bootstrap (thin): installs managed-deploy-agent only — no nginx/php/prepare.
 
 Usage:
-  curl -fsSL --proto '=https' --tlsv1.2 'https://example.com/install.sh' | sudo bash -s -- --panel-url='https://panel.example.com' --runner-key=SECRET
+  curl -fsSL --proto '=https' --tlsv1.2 'https://example.com/install.sh' | sudo bash -s -- \
+    --non-interactive --panel-url='https://panel.example.com'
 
 Options:
   --panel-url=URL       Control plane base URL
-  --runner-key=SECRET   Server runner key (prefer MANAGED_AGENT_RUNNER_KEY env over argv)
-  --non-interactive     Fail if URL or key missing
+  --runner-key=SECRET   Optional; omit to auto-generate and register (creates the server row in the panel)
+  --account-key=SECRET  Optional; SaaS onboarding only (HTTP header X-ACCOUNT-INSTALL-KEY). Not stored in agent .env after registration.
+  --install-key=SECRET Legacy alias for --account-key
+  --non-interactive     Fail if panel URL missing (runner key optional)
   --ssh-only            Skip agent; print SSH-only hints
   --agent               Install agent (default)
   --help                This help
 
-Env: MANAGED_AGENT_PANEL_URL, MANAGED_AGENT_RUNNER_KEY, MANAGED_AGENT_INSTALL_ROOT, MANAGED_AGENT_REPO_URL
+Env: MANAGED_AGENT_PANEL_URL (required), MANAGED_AGENT_RUNNER_KEY (optional), MANAGED_AGENT_ACCOUNT_KEY or RELEASEPANEL_AGENT_ACCOUNT_KEY (optional SaaS), legacy MANAGED_AGENT_PANEL_INSTALL_KEY / RELEASEPANEL_INSTALL_KEY, MANAGED_AGENT_INSTALL_ROOT, MANAGED_AGENT_REPO_URL
 EOF
 }
 
@@ -47,6 +51,14 @@ parse_args() {
                 ;;
             --runner-key=*)
                 RUNNER_KEY="${1#*=}"
+                shift
+                ;;
+            --account-key=*)
+                INSTALL_KEY="${1#*=}"
+                shift
+                ;;
+            --install-key=*)
+                INSTALL_KEY="${1#*=}"
                 shift
                 ;;
             --non-interactive)
@@ -226,11 +238,12 @@ validate_panel_url() {
 
 prompt_missing() {
     if [ -n "${PANEL_URL}" ] && [ -n "${RUNNER_KEY}" ]; then
+        [ "${RUNNER_KEY}" != "CHANGE_ME" ] || die "Runner key must not be CHANGE_ME."
         return 0
     fi
     if [ "${NON_INTERACTIVE}" -eq 1 ]; then
         [ -n "${PANEL_URL}" ] || die "Missing --panel-url= or MANAGED_AGENT_PANEL_URL (non-interactive)."
-        [ -n "${RUNNER_KEY}" ] || die "Missing --runner-key= or MANAGED_AGENT_RUNNER_KEY (non-interactive)."
+        [ "${RUNNER_KEY}" != "CHANGE_ME" ] || die "Runner key must not be CHANGE_ME."
         return 0
     fi
     if [ -z "${PANEL_URL}" ]; then
@@ -238,12 +251,11 @@ prompt_missing() {
         read -r PANEL_URL
     fi
     if [ -z "${RUNNER_KEY}" ]; then
-        printf '%s' "Runner key (from ReleasePanel server; input hidden): " >&2
+        printf '%s' "Runner key (optional — empty to auto-generate; input hidden): " >&2
         read -rs RUNNER_KEY
         printf '\n' >&2
     fi
     [ -n "${PANEL_URL}" ] || die "Panel URL required."
-    [ -n "${RUNNER_KEY}" ] || die "Runner key required."
     [ "${RUNNER_KEY}" != "CHANGE_ME" ] || die "Runner key must not be CHANGE_ME."
 }
 
@@ -323,6 +335,12 @@ main() {
 
     export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT}"
     export MANAGED_AGENT_PANEL_URL="${PANEL_URL}"
+    if [ -n "${INSTALL_KEY}" ]; then
+        export MANAGED_AGENT_ACCOUNT_KEY="${INSTALL_KEY}"
+        export RELEASEPANEL_AGENT_ACCOUNT_KEY="${INSTALL_KEY}"
+        export MANAGED_AGENT_PANEL_INSTALL_KEY="${INSTALL_KEY}"
+        export RELEASEPANEL_INSTALL_KEY="${INSTALL_KEY}"
+    fi
     if [ "${SKIP_JOIN}" -eq 0 ]; then
         export MANAGED_AGENT_RUNNER_KEY="${RUNNER_KEY}"
         export RELEASEPANEL_PANEL_URL="${PANEL_URL}"

@@ -116,6 +116,10 @@ upsert_env RELEASEPANEL_RUNNER_HEARTBEAT_MS "30000"
 upsert_env MANAGED_AGENT_SERVER_NAME "${server_name}"
 upsert_env RELEASEPANEL_SERVER_NAME "${server_name}"
 
+# Read from the environment for this registration request only — never written to the agent .env
+# (account key is onboarding-only; runner key is long-term auth).
+panel_install_key="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-${RELEASEPANEL_PANEL_INSTALL_KEY:-}}}}}"
+
 # Default outbound poll on: Prepare server, deploy, site create, SSL use POST /api/agent/poll.
 # Opt out: MANAGED_AGENT_POLL_ENABLED=false before registration.
 poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
@@ -157,18 +161,68 @@ echo "[managed-deploy-agent] Runner key written to ${RUNNER_ENV}."
 
 echo "[managed-deploy-agent] Registering this server with the control plane."
 
-curl_opts=(-fsS)
+reg_hdrs=()
 case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
     1 | true | TRUE | yes | YES | on | ON)
-        curl_opts+=(-k)
+        reg_hdrs+=(-k)
         echo "[managed-deploy-agent] WARNING: insecure TLS enabled for this registration request (private CA / untrusted panel certificate only)." >&2
         ;;
 esac
+if [ -n "${panel_install_key}" ]; then
+    reg_hdrs+=(-H "X-ACCOUNT-INSTALL-KEY: ${panel_install_key}")
+    reg_hdrs+=(-H "X-RELEASEPANEL-INSTALL-KEY: ${panel_install_key}")
+fi
 
-curl "${curl_opts[@]}" -X POST "${panel_url}/api/register-runner" \
-    -H "X-RUNNER-KEY: ${runner_key}" \
-    -H "Content-Type: application/json" \
-    -d "${payload}"
+tmp_body="$(mktemp)"
+trap 'rm -f "${tmp_body}"' EXIT
 
-echo
-echo "[managed-deploy-agent] Registration complete."
+do_register() {
+    local use_key="$1"
+    local ts sig canonical
+    ts="$(date +%s)"
+    canonical="$(printf '%s\n%s' "${ts}" "${payload}")"
+    sig="$(printf '%s' "${canonical}" | openssl dgst -sha256 -hmac "${use_key}" 2>/dev/null | awk '{print $NF}')"
+    if [ -z "${sig}" ]; then
+        fail "Could not compute runner request signature (openssl HMAC). Install OpenSSL."
+    fi
+    curl -sS "${reg_hdrs[@]}" -o "${tmp_body}" -w '%{http_code}' -X POST "${panel_url}/api/register-runner" \
+        -H "X-RUNNER-KEY: ${use_key}" \
+        -H "X-Runner-Timestamp: ${ts}" \
+        -H "X-Runner-Signature: ${sig}" \
+        -H "Content-Type: application/json" \
+        -d "${payload}"
+}
+
+http_code="$(do_register "${runner_key}")"
+body="$(cat "${tmp_body}")"
+
+if [ "${http_code}" = "409" ]; then
+    if printf '%s' "${body}" | python3 -c "import json,sys; j=json.load(sys.stdin); raise SystemExit(0 if j.get('code')=='runner_key_host_mismatch' and j.get('regenerate_runner_key') else 1)" 2>/dev/null; then
+        printf '%s\n' "[managed-deploy-agent] Runner key is already bound to another host; generating a fresh key on this VPS and retrying registration once." >&2
+        runner_key="$(openssl rand -hex 64)"
+        upsert_env MANAGED_AGENT_RUNNER_KEY "${runner_key}"
+        upsert_env RELEASEPANEL_RUNNER_KEY "${runner_key}"
+        http_code="$(do_register "${runner_key}")"
+        body="$(cat "${tmp_body}")"
+    fi
+fi
+
+case "${http_code}" in
+    2[0-9][0-9])
+        printf '%s\n' "${body}"
+        # Remove legacy onboarding secrets so rotation on the panel never affects running agents.
+        if [ -f "${RUNNER_ENV}" ]; then
+            sed -i \
+                -e '/^MANAGED_AGENT_ACCOUNT_KEY=/d' \
+                -e '/^RELEASEPANEL_AGENT_ACCOUNT_KEY=/d' \
+                -e '/^MANAGED_AGENT_PANEL_INSTALL_KEY=/d' \
+                -e '/^RELEASEPANEL_INSTALL_KEY=/d' \
+                -e '/^RELEASEPANEL_PANEL_INSTALL_KEY=/d' \
+                "${RUNNER_ENV}" 2>/dev/null || true
+        fi
+        printf '%s\n' "[managed-deploy-agent] Registration complete."
+        ;;
+    *)
+        fail "Registration failed (HTTP ${http_code}): ${body}"
+        ;;
+esac
