@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "check:bash-syntax": "bash scripts/ci/bash-syntax-check.sh",
+    "test:apt-optimizations": "bash scripts/test/apt-optimizations-unit.sh",
     "check:site-setup-shell": "bash -n scripts/site/setup-laravel-site.sh"
   },
   "dependencies": {

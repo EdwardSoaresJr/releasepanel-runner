@@ -20,55 +20,97 @@ log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Mirrors scripts/lib/apt-optimizations.sh (Ubuntu + DigitalOcean heuristic + IPv4 tuning).
-# Runs before the runner repo exists locally (bootstrap path).
+# Bootstrap path before releasepanel-runner exists: mirror probe + IPv4/timeouts aligned with scripts/lib/apt-optimizations.sh.
 _rp_git_bootstrap_apt_prepare() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 0
+    fi
     echo "[apt] forcing IPv4"
     install -d -m 0755 /etc/apt/apt.conf.d || true
-    cat >/etc/apt/apt.conf.d/99releasepanel-bootstrap.conf <<'EOF'
+    cat >/etc/apt/apt.conf.d/99releasepanel-ipv4 <<'EOF'
 Acquire::ForceIPv4 "true";
-Acquire::Retries "2";
+EOF
+    cat >/etc/apt/apt.conf.d/99releasepanel-apt-performance <<'EOF'
+Acquire::Retries "3";
 Acquire::http::Timeout "10";
 Acquire::https::Timeout "10";
+Acquire::Queue-Mode "host";
+APT::Install-Recommends "0";
+APT::Install-Suggests "0";
+DPkg::Use-Pty "0";
+DPkg::Options { "--force-confdef"; "--force-confold"; };
 EOF
 
-    local is_do=0
-    if grep -qi ubuntu /etc/os-release 2>/dev/null; then
-        if hostname 2>/dev/null | grep -qi digitalocean; then
-            is_do=1
-        fi
-        if [ "${is_do}" -eq 0 ] && [ -f /etc/motd ] && grep -qi digitalocean /etc/motd 2>/dev/null; then
-            is_do=1
-        fi
-        if [ "${is_do}" -eq 0 ] && command -v curl >/dev/null 2>&1; then
-            local droplet_id=""
-            droplet_id="$(curl -fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/metadata/v1/id 2>/dev/null || true)"
-            droplet_id="$(printf '%s' "${droplet_id}" | tr -cd '[:alnum:]')"
-            [ -n "${droplet_id}" ] && is_do=1
-        fi
-        if [ "${is_do}" -eq 1 ]; then
-            echo "[apt] enforcing fast mirrors"
-            if [ -f /etc/apt/sources.list ] && grep -qE '(archive|security)\.ubuntu\.com' /etc/apt/sources.list 2>/dev/null; then
-                sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' /etc/apt/sources.list
-            fi
-            local f
-            for f in /etc/apt/sources.list.d/*.sources; do
-                [ -f "${f}" ] || continue
-                if grep -qE '(archive|security)\.ubuntu\.com' "${f}" 2>/dev/null; then
-                    sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' "${f}"
-                fi
-            done
-            for f in /etc/apt/sources.list.d/ubuntu*.list /etc/apt/sources.list.d/*ubuntu*.list; do
-                [ -f "${f}" ] || continue
-                if grep -qE '(archive|security)\.ubuntu\.com' "${f}" 2>/dev/null; then
-                    sed -i 's|archive\.ubuntu\.com|mirrors.digitalocean.com|g; s|security\.ubuntu\.com|mirrors.digitalocean.com|g' "${f}"
-                fi
-            done
+    echo "[apt] detecting fast mirror" >&2
+    local codename="noble"
+    if grep -q '^VERSION_CODENAME=' /etc/os-release 2>/dev/null; then
+        codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' | head -n1)"
+    fi
+    local do_base="http://mirrors.digitalocean.com/ubuntu"
+    local ar_base="http://archive.ubuntu.com/ubuntu"
+    local mirror_base="${ar_base}"
+    local t=2
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS -m "${t}" --head -o /dev/null "${do_base}/dists/${codename}/InRelease" 2>/dev/null; then
+            mirror_base="${do_base}"
+        elif curl -fsS -m "${t}" --head -o /dev/null "${ar_base}/dists/${codename}/InRelease" 2>/dev/null; then
+            mirror_base="${ar_base}"
         fi
     fi
-    echo "[apt] cleaning cache"
+    echo "[apt] selected mirror: ${mirror_base}" >&2
+
+    if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+        if [ -f /etc/apt/sources.list ]; then
+            sed -E -i \
+                -e "s|https?://archive\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                -e "s|https?://security\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                -e "s|https?://[a-zA-Z0-9.-]+\\.clouds\\.archive\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                /etc/apt/sources.list 2>/dev/null || true
+        fi
+        local f=""
+        shopt -s nullglob 2>/dev/null || true
+        for f in /etc/apt/sources.list.d/*.sources; do
+            case "${f}" in
+                *nodesource* | *Nodesource*) continue ;;
+                *digitalocean* | *DigitalOcean* | *droplet*) continue ;;
+            esac
+            [ -f "${f}" ] || continue
+            sed -E -i \
+                -e "s|https?://archive\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                -e "s|https?://security\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                -e "s|https?://[a-zA-Z0-9.-]+\\.clouds\\.archive\\.ubuntu\\.com/ubuntu|${mirror_base}|g" \
+                "${f}" 2>/dev/null || true
+        done
+        shopt -u nullglob 2>/dev/null || true
+    fi
+    echo "[apt] cleaning apt cache"
     rm -rf /var/lib/apt/lists/*
     apt-get clean 2>/dev/null || true
+}
+
+# Mirrors scripts/lib/apt-optimizations.sh apt_update_safe (runner tree not cloned yet).
+_rp_git_bootstrap_apt_update_safe() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 0
+    fi
+    local attempt
+    attempt=1
+    while [ "${attempt}" -le 3 ]; do
+        echo "[apt] updating indexes"
+        if apt-get update -y; then
+            [ "${attempt}" -le 1 ] || echo "[apt] recovered after ${attempt} attempts"
+            return 0
+        fi
+        if [ "${attempt}" -eq 3 ]; then
+            echo "[apt] ERROR: apt update failed after 3 attempts" >&2
+            return 1
+        fi
+        echo "[apt] update failed attempt ${attempt}/3"
+        _rp_git_bootstrap_apt_prepare || true
+        sleep 3
+        attempt=$((attempt + 1))
+    done
+    return 1
 }
 
 usage() {
@@ -159,8 +201,8 @@ ensure_git() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         _rp_git_bootstrap_apt_prepare || true
-        apt-get update -y
-        apt-get install -y git ca-certificates
+        _rp_git_bootstrap_apt_update_safe || die "apt-get update failed after mirror tuning"
+        apt-get install -y --no-install-recommends git ca-certificates
         return 0
     fi
     if command -v dnf >/dev/null 2>&1; then

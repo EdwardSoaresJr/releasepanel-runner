@@ -38,9 +38,6 @@ command -v force_ipv4_apt >/dev/null 2>&1 || {
   echo "[provision][warn] Missing scripts/lib/apt-optimizations.sh (expected ${_lib}); continuing with distro defaults." >&2
 }
 
-force_ipv4_apt || true
-ensure_apt_acquire_timeouts || true
-
 strip_ondrej_launchpad_sources() {
   # PPA list files only; safe before software-properties-common is installed.
   # Include *.sources (deb822) and common Launchpad path spellings — do not call
@@ -109,47 +106,54 @@ ensure_universe_enabled() {
 strip_ondrej_launchpad_sources
 use_http_for_ubuntu_archive_urls
 
-export APT_UPDATE_SAFE_LOG_PROVISION=1
+force_ipv4_apt || true
+configure_apt_timeouts || true
 apply_detected_mirror || true
-clean_apt_cache_safe || true
 
-apt_update_safe
+if releasepanel_base_image_ready; then
+  echo "[provision] ReleasePanel base image detected — skipping package installation."
+else
+  clean_apt_cache_safe || true
+  apt_update_safe
 
-php_candidate=""
-php_candidate=$(apt-cache policy php8.3-cli 2>/dev/null | awk '/^  Candidate:/ {print $2; exit}')
-if [[ -z "${php_candidate}" || "${php_candidate}" == "(none)" ]]; then
-  ensure_universe_enabled
-  if [[ "${UNIVERSE_SOURCES_MODIFIED}" -eq 1 ]]; then
-    echo "[provision] Refreshing apt indexes after enabling universe ..."
-    apt_update_safe
+  php_candidate=""
+  php_candidate=$(apt-cache policy php8.3-cli 2>/dev/null | awk '/^  Candidate:/ {print $2; exit}')
+  if [[ -z "${php_candidate}" || "${php_candidate}" == "(none)" ]]; then
+    ensure_universe_enabled
+    if [[ "${UNIVERSE_SOURCES_MODIFIED}" -eq 1 ]]; then
+      echo "[provision] Refreshing apt indexes after enabling universe ..."
+      apt_update_safe
+    fi
   fi
-fi
 
-pkgs=(
-  git unzip curl ca-certificates apt-transport-https software-properties-common
-)
-if ! command -v nginx >/dev/null 2>&1; then
-  pkgs+=(nginx)
-else
-  echo "[provision] nginx already present — skipping nginx package in apt install."
-fi
-
-if ! command -v php >/dev/null 2>&1; then
-  pkgs+=(
-    php8.3 php8.3-fpm php8.3-cli
-    php8.3-mysql php8.3-curl php8.3-xml
-    php8.3-mbstring php8.3-zip php8.3-bcmath php8.3-intl php8.3-gd
+  pkgs=(
+    git unzip curl ca-certificates apt-transport-https software-properties-common
   )
-else
-  echo "[provision] php already present — skipping PHP packages in apt install."
-fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    pkgs+=(nginx)
+  else
+    echo "[provision] nginx already present — skipping nginx package in apt install."
+  fi
 
-if ! command -v composer >/dev/null 2>&1; then
-  pkgs+=(composer)
-fi
+  if ! command -v php >/dev/null 2>&1; then
+    pkgs+=(
+      php8.3 php8.3-fpm php8.3-cli
+      php8.3-mysql php8.3-curl php8.3-xml
+      php8.3-mbstring php8.3-zip php8.3-bcmath php8.3-intl php8.3-gd
+    )
+  else
+    echo "[provision] php already present — skipping PHP packages in apt install."
+  fi
 
-echo "[provision] Installing packages (single apt install)..."
-apt-get install -y --no-install-recommends "${pkgs[@]}"
+  if ! command -v composer >/dev/null 2>&1; then
+    pkgs+=(composer)
+  fi
+
+  echo "[provision] Installing packages (prefetch + install)..."
+  apt_prefetch_packages "${pkgs[@]}"
+  apt_install_packages "${pkgs[@]}"
+  releasepanel_write_base_image_marker || true
+fi
 
 if id -u deploy >/dev/null 2>&1; then
   echo "[provision] User deploy already exists."

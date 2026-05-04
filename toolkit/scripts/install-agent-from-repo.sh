@@ -43,14 +43,17 @@ install_base_packages() {
                 . "${APT_OPT}"
             fi
             if command -v force_ipv4_apt >/dev/null 2>&1; then
-                unset APT_UPDATE_SAFE_LOG_PROVISION
                 force_ipv4_apt || true
-                ensure_apt_acquire_timeouts || true
+                configure_apt_timeouts || true
                 apply_detected_mirror || true
                 clean_apt_cache_safe || true
                 apt_update_safe || die "apt-get update failed after mirror tuning"
+                APT_BASE_PKGS=(curl ca-certificates git python3)
+                apt_prefetch_packages "${APT_BASE_PKGS[@]}" || true
+                apt_install_packages "${APT_BASE_PKGS[@]}" || die "apt install failed (base packages)"
+            else
+                apt-get install -y --no-install-recommends curl ca-certificates git python3
             fi
-            apt-get install -y curl ca-certificates git python3
             ;;
         dnf)
             dnf install -y curl ca-certificates git python3
