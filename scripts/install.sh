@@ -140,18 +140,27 @@ install_or_refresh_clone() {
     export GIT_TERMINAL_PROMPT=0
     export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
 
+    inner_script="${INSTALL_ROOT}/toolkit/scripts/install-agent-from-repo.sh"
+
     if [ -d "${INSTALL_ROOT}/.git" ]; then
-        log "Updating agent repo at ${INSTALL_ROOT} (${DEFAULT_BRANCH})…"
-        if ! git -C "${INSTALL_ROOT}" fetch --depth 1 origin "${DEFAULT_BRANCH}" 2>/dev/null; then
-            warn "Git fetch failed, recloning…"
-            rm -rf "${INSTALL_ROOT}"
+        log "Updating agent repo at ${INSTALL_ROOT} (${DEFAULT_BRANCH}) — resetting to origin/${DEFAULT_BRANCH} (drops local commits; keeps untracked files like .env)…"
+        if git -C "${INSTALL_ROOT}" remote get-url origin >/dev/null 2>&1; then
+            git -C "${INSTALL_ROOT}" remote set-url origin "${DEFAULT_REPO}"
         else
-            git -C "${INSTALL_ROOT}" checkout "${DEFAULT_BRANCH}" 2>/dev/null || true
-            git -C "${INSTALL_ROOT}" pull --ff-only origin "${DEFAULT_BRANCH}" 2>/dev/null || warn "git pull failed; continuing on disk."
-            secure_install_root_permissions
-            trust_install_root_git
-            return 0
+            git -C "${INSTALL_ROOT}" remote add origin "${DEFAULT_REPO}"
         fi
+        if ! git -C "${INSTALL_ROOT}" fetch --depth 1 origin "${DEFAULT_BRANCH}"; then
+            die "git fetch failed (network/SSH?). Fix connectivity, then re-run. Left unchanged: ${INSTALL_ROOT}"
+        fi
+        if ! git -C "${INSTALL_ROOT}" checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"; then
+            die "Could not sync to origin/${DEFAULT_BRANCH}. Try: cd ${INSTALL_ROOT} && git remote -v && git status. Or back up .env, remove ${INSTALL_ROOT}, and re-run the installer."
+        fi
+        secure_install_root_permissions
+        trust_install_root_git
+        if [ ! -f "${inner_script}" ]; then
+            die "Synced repo is missing ${inner_script#"${INSTALL_ROOT}/"}. Check DEFAULT_REPO / branch (expecting releasepanel-runner ${DEFAULT_BRANCH}). Back up .env, rm -rf ${INSTALL_ROOT}, re-run."
+        fi
+        return 0
     fi
 
     if [ -e "${INSTALL_ROOT}" ] && [ ! -d "${INSTALL_ROOT}/.git" ]; then
