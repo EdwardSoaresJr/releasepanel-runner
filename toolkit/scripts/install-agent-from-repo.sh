@@ -74,14 +74,16 @@ verify_node_major() {
     fi
 }
 
-agent_env_has_runner_key() {
+agent_env_registration_complete() {
     local f="${INSTALL_ROOT}/.env"
     [ -f "${f}" ] || return 1
-    grep -qE '^MANAGED_AGENT_RUNNER_KEY=.' "${f}" 2>/dev/null || return 1
     if grep -qE '^MANAGED_AGENT_RUNNER_KEY=CHANGE_ME$' "${f}" 2>/dev/null; then
         return 1
     fi
-    return 0
+    if ! grep -qE '^MANAGED_AGENT_RUNNER_KEY=[^[:space:]]+' "${f}" 2>/dev/null; then
+        return 1
+    fi
+    grep -qE '^MANAGED_AGENT_REGISTRATION_COMPLETE=1([[:space:]]|$)' "${f}" 2>/dev/null
 }
 
 panel_url_from_agent_env() {
@@ -182,9 +184,9 @@ main() {
     trust_install_root_git
 
     SKIP_JOIN=0
-    if agent_env_has_runner_key; then
+    if agent_env_registration_complete; then
         SKIP_JOIN=1
-        log "Agent .env already has a runner key; skipping registration (join-panel)."
+        log "Agent .env shows a completed registration; skipping join-panel."
         if [ -z "${PANEL_URL}" ]; then
             PANEL_URL="$(panel_url_from_agent_env)"
         fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Registers this host with the panel (POST /api/register-runner) and writes agent .env only after success.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,68 +82,76 @@ if [ -f "${RUNNER_ENV}" ]; then
     cp "${RUNNER_ENV}" "${RUNNER_ENV}.$(date +%Y%m%d%H%M%S).bak"
 fi
 
-touch "${RUNNER_ENV}"
-chmod 600 "${RUNNER_ENV}"
-
-upsert_env() {
-    local key="$1"
-    local value="$2"
-
-    if grep -q "^${key}=" "${RUNNER_ENV}"; then
-        sed -i -E "s#^${key}=.*#${key}=${value}#" "${RUNNER_ENV}"
-    else
-        printf '%s=%s\n' "${key}" "${value}" >> "${RUNNER_ENV}"
-    fi
-}
-
-upsert_env MANAGED_AGENT_RUNNER_HOST "${MANAGED_AGENT_RUNNER_HOST:-${RELEASEPANEL_RUNNER_HOST:-127.0.0.1}}"
-upsert_env RELEASEPANEL_RUNNER_HOST "${RELEASEPANEL_RUNNER_HOST:-${MANAGED_AGENT_RUNNER_HOST:-127.0.0.1}}"
-upsert_env MANAGED_AGENT_RUNNER_PORT "9000"
-upsert_env RELEASEPANEL_RUNNER_PORT "9000"
-upsert_env MANAGED_AGENT_RUNNER_KEY "${runner_key}"
-upsert_env RELEASEPANEL_RUNNER_KEY "${runner_key}"
-upsert_env MANAGED_AGENT_RUNNER_LOG "/var/log/managed-deploy-agent.log"
-upsert_env RELEASEPANEL_RUNNER_LOG "/var/log/managed-deploy-agent.log"
-upsert_env MANAGED_AGENT_RUNNER_NORMAL_TIMEOUT_MS "120000"
-upsert_env RELEASEPANEL_RUNNER_NORMAL_TIMEOUT_MS "120000"
-upsert_env MANAGED_AGENT_RUNNER_DEPLOY_TIMEOUT_MS "900000"
-upsert_env RELEASEPANEL_RUNNER_DEPLOY_TIMEOUT_MS "900000"
-upsert_env MANAGED_AGENT_PANEL_URL "${panel_url}"
-upsert_env RELEASEPANEL_PANEL_URL "${panel_url}"
-upsert_env MANAGED_AGENT_RUNNER_PUBLIC_URL "${runner_url}"
-upsert_env RELEASEPANEL_RUNNER_PUBLIC_URL "${runner_url}"
-upsert_env MANAGED_AGENT_RUNNER_HEARTBEAT_MS "30000"
-upsert_env RELEASEPANEL_RUNNER_HEARTBEAT_MS "30000"
-upsert_env MANAGED_AGENT_SERVER_NAME "${server_name}"
-upsert_env RELEASEPANEL_SERVER_NAME "${server_name}"
-
 # Read from the environment for this registration request only — never written to the agent .env
 # (account key is onboarding-only; runner key is long-term auth).
 panel_install_key="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-${RELEASEPANEL_PANEL_INSTALL_KEY:-}}}}}"
 
 # Default outbound poll on: Prepare server, deploy, site create, SSL use POST /api/agent/poll.
-# Opt out: MANAGED_AGENT_POLL_ENABLED=false before registration.
 poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
 if [ -z "${poll_raw}" ]; then
     poll_raw=true
 fi
+poll_enabled_write=true
 case "${poll_raw}" in
     0 | false | FALSE | no | NO | off | OFF)
-        upsert_env MANAGED_AGENT_POLL_ENABLED "false"
-        upsert_env RELEASEPANEL_POLL_ENABLED "false"
-        ;;
-    *)
-        upsert_env MANAGED_AGENT_POLL_ENABLED "true"
-        upsert_env RELEASEPANEL_POLL_ENABLED "true"
+        poll_enabled_write=false
         ;;
 esac
 
-case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
-    1 | true | TRUE | yes | YES | on | ON)
-        upsert_env MANAGED_AGENT_PANEL_INSECURE_TLS "1"
-        upsert_env RELEASEPANEL_PANEL_INSECURE_TLS "1"
-        ;;
-esac
+write_env_after_success() {
+    local rk="$1"
+    local tmp
+    tmp="$(mktemp)"
+    chmod 600 "${tmp}" 2>/dev/null || true
+    {
+        printf 'MANAGED_AGENT_RUNNER_HOST=%s\n' "${MANAGED_AGENT_RUNNER_HOST:-${RELEASEPANEL_RUNNER_HOST:-127.0.0.1}}"
+        printf 'RELEASEPANEL_RUNNER_HOST=%s\n' "${RELEASEPANEL_RUNNER_HOST:-${MANAGED_AGENT_RUNNER_HOST:-127.0.0.1}}"
+        printf 'MANAGED_AGENT_RUNNER_PORT=9000\n'
+        printf 'RELEASEPANEL_RUNNER_PORT=9000\n'
+        printf 'MANAGED_AGENT_RUNNER_KEY=%s\n' "${rk}"
+        printf 'RELEASEPANEL_RUNNER_KEY=%s\n' "${rk}"
+        printf 'MANAGED_AGENT_RUNNER_LOG=/var/log/managed-deploy-agent.log\n'
+        printf 'RELEASEPANEL_RUNNER_LOG=/var/log/managed-deploy-agent.log\n'
+        printf 'MANAGED_AGENT_RUNNER_NORMAL_TIMEOUT_MS=120000\n'
+        printf 'RELEASEPANEL_RUNNER_NORMAL_TIMEOUT_MS=120000\n'
+        printf 'MANAGED_AGENT_RUNNER_DEPLOY_TIMEOUT_MS=900000\n'
+        printf 'RELEASEPANEL_RUNNER_DEPLOY_TIMEOUT_MS=900000\n'
+        printf 'MANAGED_AGENT_PANEL_URL=%s\n' "${panel_url}"
+        printf 'RELEASEPANEL_PANEL_URL=%s\n' "${panel_url}"
+        printf 'MANAGED_AGENT_RUNNER_PUBLIC_URL=%s\n' "${runner_url}"
+        printf 'RELEASEPANEL_RUNNER_PUBLIC_URL=%s\n' "${runner_url}"
+        printf 'MANAGED_AGENT_RUNNER_HEARTBEAT_MS=30000\n'
+        printf 'RELEASEPANEL_RUNNER_HEARTBEAT_MS=30000\n'
+        printf 'MANAGED_AGENT_SERVER_NAME=%s\n' "${server_name}"
+        printf 'RELEASEPANEL_SERVER_NAME=%s\n' "${server_name}"
+        if [ "${poll_enabled_write}" = true ]; then
+            printf 'MANAGED_AGENT_POLL_ENABLED=true\n'
+            printf 'RELEASEPANEL_POLL_ENABLED=true\n'
+        else
+            printf 'MANAGED_AGENT_POLL_ENABLED=false\n'
+            printf 'RELEASEPANEL_POLL_ENABLED=false\n'
+        fi
+        printf 'MANAGED_AGENT_REGISTRATION_COMPLETE=1\n'
+        printf 'RELEASEPANEL_REGISTRATION_COMPLETE=1\n'
+        case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
+            1 | true | TRUE | yes | YES | on | ON)
+                printf 'MANAGED_AGENT_PANEL_INSECURE_TLS=1\n'
+                printf 'RELEASEPANEL_PANEL_INSECURE_TLS=1\n'
+                ;;
+        esac
+    } > "${tmp}"
+    mv -f "${tmp}" "${RUNNER_ENV}"
+    chmod 600 "${RUNNER_ENV}"
+
+    # Remove legacy onboarding secrets if a backup or merge left them (never persist account key).
+    sed -i \
+        -e '/^MANAGED_AGENT_ACCOUNT_KEY=/d' \
+        -e '/^RELEASEPANEL_AGENT_ACCOUNT_KEY=/d' \
+        -e '/^MANAGED_AGENT_PANEL_INSTALL_KEY=/d' \
+        -e '/^RELEASEPANEL_INSTALL_KEY=/d' \
+        -e '/^RELEASEPANEL_PANEL_INSTALL_KEY=/d' \
+        "${RUNNER_ENV}" 2>/dev/null || true
+}
 
 payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"runner_url":%s,"server_id":%s}' \
     "$(quote_json "${server_name}")" \
@@ -152,14 +161,12 @@ payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"runner_url":%s,"serv
     "$(quote_json "${server_id}")")"
 
 case "${runner_url}" in
-    http://127.0.0.1*|http://localhost*|https://127.0.0.1*|https://localhost*)
+    http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*)
         printf '%s\n' "[managed-deploy-agent] WARN: runner_url is ${runner_url}. The hosted panel cannot open that address from its own network. Set MANAGED_AGENT_RUNNER_PUBLIC_URL (tunnel, VPN URL, or http(s)://YOUR_PUBLIC_IP:9000 with bind 0.0.0.0 + firewall allowlist) then restart the agent. See docs/agent-panel-connection.md." >&2
         ;;
 esac
 
-echo "[managed-deploy-agent] Runner key written to ${RUNNER_ENV}."
-
-echo "[managed-deploy-agent] Registering this server with the control plane."
+printf '%s\n' "[managed-deploy-agent] Registering with control plane (agent .env is written only after success)…"
 
 reg_hdrs=()
 case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TLS:-}}" in
@@ -200,8 +207,6 @@ if [ "${http_code}" = "409" ]; then
     if printf '%s' "${body}" | python3 -c "import json,sys; j=json.load(sys.stdin); raise SystemExit(0 if j.get('code')=='runner_key_host_mismatch' and j.get('regenerate_runner_key') else 1)" 2>/dev/null; then
         printf '%s\n' "[managed-deploy-agent] Runner key is already bound to another host; generating a fresh key on this VPS and retrying registration once." >&2
         runner_key="$(openssl rand -hex 32)"
-        upsert_env MANAGED_AGENT_RUNNER_KEY "${runner_key}"
-        upsert_env RELEASEPANEL_RUNNER_KEY "${runner_key}"
         http_code="$(do_register "${runner_key}")"
         body="$(cat "${tmp_body}")"
     fi
@@ -210,17 +215,8 @@ fi
 case "${http_code}" in
     2[0-9][0-9])
         printf '%s\n' "${body}"
-        # Remove legacy onboarding secrets so rotation on the panel never affects running agents.
-        if [ -f "${RUNNER_ENV}" ]; then
-            sed -i \
-                -e '/^MANAGED_AGENT_ACCOUNT_KEY=/d' \
-                -e '/^RELEASEPANEL_AGENT_ACCOUNT_KEY=/d' \
-                -e '/^MANAGED_AGENT_PANEL_INSTALL_KEY=/d' \
-                -e '/^RELEASEPANEL_INSTALL_KEY=/d' \
-                -e '/^RELEASEPANEL_PANEL_INSTALL_KEY=/d' \
-                "${RUNNER_ENV}" 2>/dev/null || true
-        fi
-        printf '%s\n' "[managed-deploy-agent] Registration complete."
+        write_env_after_success "${runner_key}"
+        printf '%s\n' "[managed-deploy-agent] Wrote ${RUNNER_ENV} and registration complete."
         ;;
     *)
         fail "Registration failed (HTTP ${http_code}): ${body}"
