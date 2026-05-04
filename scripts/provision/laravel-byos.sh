@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# Canonical Laravel BYOS "Prepare server" script (customer VPS only).
-# ReleasePanel panel queues this file's contents as the provision agent job payload.
-# Source of truth: releasepanel-runner — do not duplicate in the panel repo except as an emergency fallback.
+# Laravel BYOS "Prepare server" — customer VPS only. Single source of truth (releasepanel-runner).
+# The panel reads this file from the runner checkout on the control plane and sends it as the agent provision payload.
 #
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
