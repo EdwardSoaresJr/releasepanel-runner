@@ -159,6 +159,14 @@ if [ "$ENABLE_QUEUE" = true ]; then
     if ! dpkg -s supervisor >/dev/null 2>&1; then
       if [ ! -d /var/lib/apt/lists ] || [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]; then
         log "Refreshing apt lists (supervisor install)"
+        _lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-optimizations.sh"
+        if [ -f "${_lib}" ]; then
+          # shellcheck source=/dev/null
+          . "${_lib}"
+          command -v force_ipv4_apt >/dev/null 2>&1 && force_ipv4_apt || true
+          command -v force_fast_apt_mirrors >/dev/null 2>&1 && force_fast_apt_mirrors || true
+          command -v clean_apt_cache_safe >/dev/null 2>&1 && clean_apt_cache_safe || true
+        fi
         apt-get update -y
       fi
       apt-get install -y --no-install-recommends supervisor
