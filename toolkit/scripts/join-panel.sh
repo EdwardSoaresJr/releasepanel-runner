@@ -105,5 +105,12 @@ case "${MANAGED_AGENT_TAILSCALE_BIND:-}" in
         ;;
 esac
 
+install_key_effective="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-}}}}"
+if [ -n "${install_key_effective}" ]; then
+    echo "[join-panel] Account install key: present (--account-key= / MANAGED_AGENT_ACCOUNT_KEY)."
+else
+    printf '%s\n' "[join-panel] WARN: no account install key in environment. If registration fails with account_install_key_required, pass --account-key= or export MANAGED_AGENT_ACCOUNT_KEY." >&2
+fi
+
 echo "[join-panel] Running registration (writes agent .env + POST /api/register-runner)..."
 exec bash "${SCRIPT_DIR}/register-server.sh" "${panel_url}"

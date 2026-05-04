@@ -18,6 +18,49 @@ fail() {
     exit 1
 }
 
+# Print panel JSON (code/message/hint) to stderr; works for install-key and other registration errors.
+registration_error_to_stderr() {
+    local http_code="$1"
+    local body="$2"
+    printf '%s' "${body}" | python3 -c '
+import json, sys
+http = sys.argv[1]
+raw = sys.stdin.read()
+print("", file=sys.stderr)
+print("\033[1;31m[managed-deploy-agent] Registration rejected by the control plane\033[0m", file=sys.stderr)
+print(f"  HTTP: {http}", file=sys.stderr)
+try:
+    j = json.loads(raw) if raw.strip() else {}
+except json.JSONDecodeError:
+    print("  (response was not JSON — full body below)", file=sys.stderr)
+    print(raw[:4000] if raw else "(empty)", file=sys.stderr)
+    sys.exit(0)
+code = j.get("code") or ""
+msg = j.get("message") or ""
+hint = j.get("hint") or ""
+if code:
+    print(f"  code: {code}", file=sys.stderr)
+if msg:
+    print(f"  message: {msg}", file=sys.stderr)
+if hint:
+    print(f"  hint: {hint}", file=sys.stderr)
+guides = {
+    "install_key_invalid": "Install key is wrong or unknown. In ReleasePanel: copy the current key from Connect server / Settings, or Rotate Install Key and use the new key.",
+    "install_key_exhausted": "This install key was already used (single-use). Rotate Install Key in ReleasePanel, then re-run install or: managed-deploy join <panel-url> --account-key=<NEW_KEY>",
+    "install_key_expired": "Install key expired. Rotate Install Key in ReleasePanel and try again.",
+    "account_install_key_required": "Panel requires an install key but none was sent. Pass --account-key= on install or export MANAGED_AGENT_ACCOUNT_KEY before join.",
+    "account_install_key_mismatch": "Key does not match this account. Confirm you copied the key for the correct organization.",
+}
+g = guides.get(code)
+if g:
+    print("", file=sys.stderr)
+    print("  → " + g, file=sys.stderr)
+elif raw.strip() and not code:
+    print("", file=sys.stderr)
+    print("  raw: " + raw[:800], file=sys.stderr)
+' "${http_code}" || true
+}
+
 quote_json() {
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
@@ -235,6 +278,7 @@ case "${http_code}" in
         printf '%s\n' "[managed-deploy-agent] Wrote ${RUNNER_ENV} and registration complete."
         ;;
     *)
-        fail "Registration failed (HTTP ${http_code}): ${body}"
+        registration_error_to_stderr "${http_code}" "${body}"
+        fail "Registration failed (HTTP ${http_code}). See the details above (especially code: install_key_*)."
         ;;
 esac

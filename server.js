@@ -128,6 +128,48 @@ function registrationComplete() {
     return envTruthy('MANAGED_AGENT_REGISTRATION_COMPLETE', 'RELEASEPANEL_REGISTRATION_COMPLETE');
 }
 
+const PANEL_ONBOARDING_HINT_THROTTLE_MS = 5 * 60 * 1000;
+/** @type {Record<string, number>} */
+const lastOnboardingRejectLog = Object.create(null);
+
+/**
+ * When registration is still incomplete, surface install-key / onboarding errors on stderr
+ * (visible in journalctl) — appendLog() only writes the JSON file and is easy to miss.
+ */
+function maybePanelOnboardingRejectedConsoleHint(pathname, panelResponse) {
+    if (registrationComplete()) {
+        return;
+    }
+    const code = panelResponse?.json?.code;
+    if (code == null || typeof code !== 'string' || code === '') {
+        return;
+    }
+    const onboarding = code.startsWith('install_key_')
+        || code === 'account_install_key_required'
+        || code === 'account_install_key_mismatch';
+    if (!onboarding) {
+        return;
+    }
+    const now = Date.now();
+    const slot = `${pathname}:${code}`;
+    const prev = lastOnboardingRejectLog[slot] || 0;
+    if (now - prev < PANEL_ONBOARDING_HINT_THROTTLE_MS) {
+        return;
+    }
+    lastOnboardingRejectLog[slot] = now;
+    const msg = panelResponse.json?.message || '';
+    const hint = panelResponse.json?.hint || '';
+    const detail = `${code}${msg ? ` — ${msg}` : ''}${hint ? `. ${hint}` : ''}`;
+    console.error(
+        `[managed-deploy-agent] ${pathname}: ${detail} `
+        + 'Registration is incomplete. In ReleasePanel, rotate/copy the install key if needed, then run '
+        + '`sudo managed-deploy join <panel-url> --account-key=<key>` '
+        + '(or re-run install with --account-key=). '
+        + 'Repeated messages are throttled to every '
+        + `${Math.round(PANEL_ONBOARDING_HINT_THROTTLE_MS / 1000)}s per error code.`,
+    );
+}
+
 /** When unset, default poll on if a panel URL is configured (hosted / NAT installs). Opt out: MANAGED_AGENT_POLL_ENABLED=false */
 function envPollEnabled(panelUrlNormalized) {
  const raw = process.env.MANAGED_AGENT_POLL_ENABLED || process.env.RELEASEPANEL_POLL_ENABLED;
@@ -514,6 +556,9 @@ async function sendHeartbeat() {
                       hint: response.json?.hint ?? null,
                   }),
         });
+        if (!response.ok) {
+            maybePanelOnboardingRejectedConsoleHint('/api/runner-heartbeat', response);
+        }
     } catch (error) {
         appendLog({
             event: 'heartbeat',
@@ -2897,6 +2942,7 @@ async function runAgentPollCycle() {
                     message: res.json?.message ?? null,
                     hint: res.json?.hint ?? null,
                 });
+                maybePanelOnboardingRejectedConsoleHint('/api/agent/poll', res);
             }
             return;
         }
