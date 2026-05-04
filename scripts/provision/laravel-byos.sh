@@ -6,6 +6,19 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+install -d -m 0755 /etc/apt/apt.conf.d
+cat >/etc/apt/apt.conf.d/99releasepanel-optimizations <<'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "2";
+Acquire::http::Timeout "10";
+Acquire::https::Timeout "10";
+Acquire::Queue-Mode "host";
+APT::Install-Recommends "0";
+APT::Install-Suggests "0";
+DPkg::Use-Pty "0";
+DPkg::Options { "--force-confdef"; "--force-confold"; };
+EOF
+
 if [[ ! -f /etc/os-release ]]; then
   echo "Missing /etc/os-release — unsupported OS." >&2
   exit 1
@@ -44,8 +57,23 @@ strip_ondrej_launchpad_sources() {
   shopt -u nullglob
 }
 
+# Optional: use http:// for official Ubuntu archive URLs to reduce TLS CPU on small VPS.
+use_http_for_ubuntu_archive_urls() {
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu-server.sources; do
+    [[ -f "${f}" ]] || continue
+    if grep -q 'https://' "${f}"; then
+      echo "[provision] Switching Ubuntu archive URLs to http:// in ${f} (optional, low-resource tuning) ..."
+      sed -i 's|https://|http://|g' "${f}"
+    fi
+  done
+}
+
 # Minimal / odd mirrors: universe may be missing from indexes (PHP / composer).
+# Sets UNIVERSE_SOURCES_MODIFIED=1 when sources were changed; does not run apt-get update.
 ensure_universe_enabled() {
+  UNIVERSE_SOURCES_MODIFIED=0
+
   if grep -RqE '^[^#].*universe' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
     return 0
   fi
@@ -75,32 +103,69 @@ ensure_universe_enabled() {
   done
   shopt -u nullglob
 
-  apt-get update -y
+  UNIVERSE_SOURCES_MODIFIED=1
 }
 
-echo "[provision] Updating apt indexes ..."
+apt_get_update_retry() {
+  echo "[provision] Updating apt indexes (retry safe)..."
+  local i
+  for i in 1 2 3; do
+    if apt-get update -y; then
+      if [[ "${i}" -gt 1 ]]; then
+        echo "[provision] apt recovered after ${i} attempts"
+      fi
+      return 0
+    fi
+    echo "[provision] apt update failed (attempt ${i}), retrying..."
+    sleep 3
+  done
+  echo "[provision] ERROR: apt-get update failed after 3 attempts." >&2
+  return 1
+}
+
 strip_ondrej_launchpad_sources
-apt-get update -y
+use_http_for_ubuntu_archive_urls
+echo "[provision] Cleaning apt cache (mirror sync safety)..."
+rm -rf /var/lib/apt/lists/*
+apt-get clean
 
-echo "[provision] Installing base packages..."
-apt-get install -y --no-install-recommends \
-  nginx git unzip curl ca-certificates apt-transport-https software-properties-common
+apt_get_update_retry
 
-echo "[provision] Installing PHP (native noble packages)..."
-strip_ondrej_launchpad_sources || true
-apt-get update -y
 php_candidate=""
 php_candidate=$(apt-cache policy php8.3-cli 2>/dev/null | awk '/^  Candidate:/ {print $2; exit}')
 if [[ -z "${php_candidate}" || "${php_candidate}" == "(none)" ]]; then
   ensure_universe_enabled
+  if [[ "${UNIVERSE_SOURCES_MODIFIED}" -eq 1 ]]; then
+    echo "[provision] Refreshing apt indexes after enabling universe ..."
+    apt_get_update_retry
+  fi
 fi
 
-echo "[provision] Installing PHP 8.3, extensions, and distro composer..."
-apt-get install -y --no-install-recommends \
-  php8.3 php8.3-fpm php8.3-cli \
-  php8.3-mysql php8.3-curl php8.3-xml \
-  php8.3-mbstring php8.3-zip php8.3-bcmath php8.3-intl php8.3-gd \
-  composer
+pkgs=(
+  git unzip curl ca-certificates apt-transport-https software-properties-common
+)
+if ! command -v nginx >/dev/null 2>&1; then
+  pkgs+=(nginx)
+else
+  echo "[provision] nginx already present — skipping nginx package in apt install."
+fi
+
+if ! command -v php >/dev/null 2>&1; then
+  pkgs+=(
+    php8.3 php8.3-fpm php8.3-cli
+    php8.3-mysql php8.3-curl php8.3-xml
+    php8.3-mbstring php8.3-zip php8.3-bcmath php8.3-intl php8.3-gd
+  )
+else
+  echo "[provision] php already present — skipping PHP packages in apt install."
+fi
+
+if ! command -v composer >/dev/null 2>&1; then
+  pkgs+=(composer)
+fi
+
+echo "[provision] Installing packages (single apt install)..."
+apt-get install -y --no-install-recommends "${pkgs[@]}"
 
 if id -u deploy >/dev/null 2>&1; then
   echo "[provision] User deploy already exists."
@@ -122,10 +187,7 @@ rm -f /etc/nginx/sites-enabled/default || true
 
 echo "[provision] Enabling nginx + php8.3-fpm ..."
 systemctl daemon-reexec 2>/dev/null || true
-systemctl enable --now nginx 2>/dev/null || true
-systemctl enable --now php8.3-fpm 2>/dev/null || true
-systemctl restart php8.3-fpm 2>/dev/null || true
-systemctl restart nginx 2>/dev/null || true
+systemctl enable --now nginx php8.3-fpm 2>/dev/null || true
 
 if nginx -t 2>/dev/null; then
   systemctl reload nginx 2>/dev/null || true
