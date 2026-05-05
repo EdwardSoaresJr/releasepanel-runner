@@ -79,14 +79,15 @@ case "${panel_url_lc}" in
     https://*)
         hosted_panel_expects_routable_runner_url=true
         case "${panel_url_lc}" in
-            https://localhost* | https://127.0.0.1* | https://\[::1\]* | https://::1* | https://[::1]*)
+            # Never use unescaped "[::1]" in case patterns — "[" starts a character class and matches public IPv4s like 143.x / 10.x.
+            https://localhost* | https://127.0.0.1* | https://\[::1\]* | https://::1*)
                 hosted_panel_expects_routable_runner_url=false
                 ;;
         esac
         ;;
     http://*)
         case "${panel_url_lc}" in
-            http://localhost* | http://127.0.0.1* | http://\[::1\]* | http://::1* | http://[::1]*)
+            http://localhost* | http://127.0.0.1* | http://\[::1\]* | http://::1*)
                 ;;
             *)
                 hosted_panel_expects_routable_runner_url=true
@@ -106,7 +107,7 @@ releasepanel_is_loopback_agent_runner_url() {
     case "${lc}" in
         '') return 1 ;;
         http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*) return 0 ;;
-        http://\[::1\]*:* | https://\[::1\]*:* | http://[::1]*:* | https://[::1]*:*) return 0 ;;
+        http://\[::1\]*:* | https://\[::1\]*:* | http://::1*:* | https://::1*:*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -248,7 +249,7 @@ case "${runner_url}" in
     http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*)
         is_loopback_runner_url=true
         ;;
-    http://\[::1\]*:* | https://\[::1\]*:* | http://[::1]*:* | https://[::1]*:*)
+    http://\[::1\]*:* | https://\[::1\]*:* | http://::1*:* | https://::1*:*)
         is_loopback_runner_url=true
         ;;
 esac
