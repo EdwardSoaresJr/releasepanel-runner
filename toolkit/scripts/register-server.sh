@@ -50,6 +50,7 @@ guides = {
     "install_key_expired": "Install key expired. Rotate Install Key in ReleasePanel and try again.",
     "account_install_key_required": "Panel requires an install key but none was sent. Pass --account-key= on install or export MANAGED_AGENT_ACCOUNT_KEY before join.",
     "account_install_key_mismatch": "Key does not match this account. Confirm you copied the key for the correct organization.",
+    "install_key_invalid": "The panel received a full key that does not match your org (hash lookup failed). Open Settings → Rotate or copy the current install key, paste with no spaces or line breaks, and retry. If this copy was from Word/Slack/email, re-copy from the browser (CRLF and hidden characters cause this).",
     "runner_url_loopback_rejected": "Your installer is stale or still sending 127.0.0.1 as runner_url. On the VPS: cd /opt/managed-deploy-agent && git pull && git -C toolkit pull origin main (or reinstall), then retry join — or upgrade app.releasepanel.com to the latest releasepanel-app.",
 }
 g = guides.get(code)
@@ -72,6 +73,55 @@ panel_url="${1:-${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}}"
 [ -n "${panel_url}" ] || fail "Usage: ${0##*/} <control-plane-url> [server-name] [runner-url]"
 panel_url="${panel_url%/}"
 panel_url_lc="$(printf '%s' "${panel_url}" | tr '[:upper:]' '[:lower:]')"
+
+# SaaS/hosted URLs cannot POST back to localhost on the agent — used to ignore stale 127.0.0.1 in env while still allowing self-hosted LAN panels.
+hosted_panel_expects_routable_runner_url=false
+case "${panel_url_lc}" in
+    https://*)
+        hosted_panel_expects_routable_runner_url=true
+        case "${panel_url_lc}" in
+            https://localhost* | https://127.0.0.1* | https://\[::1\]* | https://::1* | https://[::1]*)
+                hosted_panel_expects_routable_runner_url=false
+                ;;
+        esac
+        ;;
+    http://*)
+        case "${panel_url_lc}" in
+            http://localhost* | http://127.0.0.1* | http://\[::1\]* | http://::1* | http://[::1]*)
+                ;;
+            *)
+                hosted_panel_expects_routable_runner_url=true
+                ;;
+        esac
+        ;;
+esac
+
+releasepanel_is_loopback_agent_runner_url() {
+    local lc
+    lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${lc}" in
+        '') return 1 ;;
+        http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*) return 0 ;;
+        http://\[::1\]*:* | https://\[::1\]*:* | http://[::1]*:* | https://[::1]*:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+MANAGED_AGENT_RUNNER_PUBLIC_URL="${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}"
+RELEASEPANEL_RUNNER_PUBLIC_URL="${RELEASEPANEL_RUNNER_PUBLIC_URL:-}"
+MANAGED_AGENT_RUNNER_PUBLIC_URL="${MANAGED_AGENT_RUNNER_PUBLIC_URL//$'\r'/}"
+RELEASEPANEL_RUNNER_PUBLIC_URL="${RELEASEPANEL_RUNNER_PUBLIC_URL//$'\r'/}"
+
+if [ "${hosted_panel_expects_routable_runner_url}" = true ]; then
+    if releasepanel_is_loopback_agent_runner_url "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}"; then
+        printf '%s\n' "[managed-deploy-agent] Ignoring stale loopback MANAGED_AGENT_RUNNER_PUBLIC_URL (${MANAGED_AGENT_RUNNER_PUBLIC_URL}) for hosted HTTPS panel — deriving runner_url from egress IP or omitting from JSON instead." >&2
+        MANAGED_AGENT_RUNNER_PUBLIC_URL=""
+    fi
+    if releasepanel_is_loopback_agent_runner_url "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}"; then
+        printf '%s\n' "[managed-deploy-agent] Ignoring stale loopback RELEASEPANEL_RUNNER_PUBLIC_URL (${RELEASEPANEL_RUNNER_PUBLIC_URL})." >&2
+        RELEASEPANEL_RUNNER_PUBLIC_URL=""
+    fi
+fi
 
 server_name="${2:-${MANAGED_AGENT_SERVER_NAME:-${RELEASEPANEL_SERVER_NAME:-$(hostname -f 2>/dev/null || hostname)}}}"
 reported_hostname="$(hostname -f 2>/dev/null || hostname)"
@@ -176,28 +226,6 @@ fi
 runner_key="${MANAGED_AGENT_RUNNER_KEY:-${RELEASEPANEL_RUNNER_KEY:-}}"
 server_id="${MANAGED_AGENT_SERVER_ID:-${RELEASEPANEL_SERVER_ID:-}}"
 
-# Omit runner_url JSON when empty (no localhost default) or when hosted panel cannot use loopback.
-hosted_panel_expects_routable_runner_url=false
-case "${panel_url_lc}" in
-    https://*)
-        hosted_panel_expects_routable_runner_url=true
-        case "${panel_url_lc}" in
-            https://localhost* | https://127.0.0.1* | https://\[::1\]* | https://::1* | https://[::1]*)
-                hosted_panel_expects_routable_runner_url=false
-                ;;
-        esac
-        ;;
-    http://*)
-        case "${panel_url_lc}" in
-            http://localhost* | http://127.0.0.1* | http://\[::1\]* | http://::1* | http://[::1]*)
-                ;;
-            *)
-                hosted_panel_expects_routable_runner_url=true
-                ;;
-        esac
-        ;;
-esac
-
 send_loopback_runner_in_json=false
 case "${MANAGED_AGENT_REGISTER_SEND_LOOPBACK_RUNNER_URL:-${RELEASEPANEL_REGISTER_SEND_LOOPBACK_RUNNER_URL:-}}" in
     1 | true | TRUE | yes | YES | on | ON)
@@ -286,6 +314,10 @@ if [ -f "${RUNNER_ENV}" ]; then
 fi
 
 panel_install_key="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-${RELEASEPANEL_PANEL_INSTALL_KEY:-}}}}}}"
+panel_install_key="${panel_install_key//$'\r'/}"
+if [ -n "${panel_install_key}" ] && command -v python3 >/dev/null 2>&1; then
+    panel_install_key="$(python3 -c 'import sys; print(sys.argv[1].strip())' "${panel_install_key}")"
+fi
 
 poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
 if [ -z "${poll_raw}" ]; then

@@ -11,6 +11,17 @@ fail() {
 
 panel_url=""
 positional=""
+# Normalize install key once (Windows clipboard CR, leading/trailing whitespace).
+releasepanel_normalize_account_install_arg() {
+    local k="$1"
+    k="${k//$'\r'/}"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys; print(sys.argv[1].strip())' "${k}"
+        return
+    fi
+    printf '%s' "${k}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --panel-url=*)
@@ -18,7 +29,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --account-key=* | --install-key=*)
-            k="${1#*=}"
+            k="$(releasepanel_normalize_account_install_arg "${1#*=}")"
             export MANAGED_AGENT_ACCOUNT_KEY="${k}"
             export RELEASEPANEL_AGENT_ACCOUNT_KEY="${k}"
             export MANAGED_AGENT_PANEL_INSTALL_KEY="${k}"
@@ -104,13 +115,6 @@ case "${MANAGED_AGENT_TAILSCALE_BIND:-}" in
         echo "[join-panel] MANAGED_AGENT_TAILSCALE_BIND=1 — MANAGED_AGENT_RUNNER_HOST=${MANAGED_AGENT_RUNNER_HOST:-${RELEASEPANEL_RUNNER_HOST:-127.0.0.1}} (restrict tcp/9000 to Tailscale 100.64.0.0/10; see docs/agent-panel-connection.md)." >&2
         ;;
 esac
-
-install_key_effective="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-}}}}"
-if [ -n "${install_key_effective}" ]; then
-    echo "[join-panel] Account install key: present (--account-key= / MANAGED_AGENT_ACCOUNT_KEY)."
-else
-    printf '%s\n' "[join-panel] WARN: no account install key in environment. If registration fails with account_install_key_required, pass --account-key= or export MANAGED_AGENT_ACCOUNT_KEY." >&2
-fi
 
 echo "[join-panel] Running registration (writes agent .env + POST /api/register-runner)..."
 exec bash "${SCRIPT_DIR}/register-server.sh" "${panel_url}"
