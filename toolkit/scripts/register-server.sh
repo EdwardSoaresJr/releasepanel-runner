@@ -50,6 +50,7 @@ guides = {
     "install_key_expired": "Install key expired. Rotate Install Key in ReleasePanel and try again.",
     "account_install_key_required": "Panel requires an install key but none was sent. Pass --account-key= on install or export MANAGED_AGENT_ACCOUNT_KEY before join.",
     "account_install_key_mismatch": "Key does not match this account. Confirm you copied the key for the correct organization.",
+    "runner_url_loopback_rejected": "Your installer is stale or still sending 127.0.0.1 as runner_url. On the VPS: cd /opt/managed-deploy-agent && git pull && git -C toolkit pull origin main (or reinstall), then retry join — or upgrade app.releasepanel.com to the latest releasepanel-app.",
 }
 g = guides.get(code)
 if g:
@@ -70,12 +71,134 @@ quote_json() {
 panel_url="${1:-${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}}"
 [ -n "${panel_url}" ] || fail "Usage: ${0##*/} <control-plane-url> [server-name] [runner-url]"
 panel_url="${panel_url%/}"
+panel_url_lc="$(printf '%s' "${panel_url}" | tr '[:upper:]' '[:lower:]')"
+
 server_name="${2:-${MANAGED_AGENT_SERVER_NAME:-${RELEASEPANEL_SERVER_NAME:-$(hostname -f 2>/dev/null || hostname)}}}"
 reported_hostname="$(hostname -f 2>/dev/null || hostname)"
-public_ip="$(curl -fsS https://api.ipify.org 2>/dev/null || curl -fsS https://ifconfig.me 2>/dev/null || true)"
-runner_url="${3:-${MANAGED_AGENT_RUNNER_PUBLIC_URL:-${RELEASEPANEL_RUNNER_PUBLIC_URL:-http://127.0.0.1:9000}}}"
+
+# Public egress IPv4 only: curl -4 + IPv4 text endpoints first; optional link-local cloud metadata fallbacks last.
+releasepanel_probe_public_ipv4() {
+    printf '%s' "$(
+        curl -4fsS --connect-timeout 10 --max-time 20 "${1}" 2>/dev/null || true
+    )" | tr -d '[:space:]'
+}
+
+public_ip=""
+for _probe_url in \
+    "https://api4.ipify.org" \
+    "https://ipv4.icanhazip.com" \
+    "https://checkip.amazonaws.com" \
+    "https://ifconfig.me/ip"; do
+    candidate="$(releasepanel_probe_public_ipv4 "${_probe_url}")"
+    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        public_ip="${candidate}"
+        break
+    fi
+done
+
+if [ -z "${public_ip}" ]; then
+    candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || true)"
+    candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
+    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        public_ip="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via metadata (169.254.169.254)." >&2
+    fi
+fi
+if [ -z "${public_ip}" ]; then
+    candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 \
+        -H "Metadata-Flavor: Google" \
+        "http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || true)"
+    candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
+    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        public_ip="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via GCP metadata." >&2
+    fi
+fi
+if [ -z "${public_ip}" ]; then
+    candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
+    candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
+    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        public_ip="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via EC2-compatible metadata." >&2
+    fi
+fi
+
+runner_port="${MANAGED_AGENT_RUNNER_PORT:-${RELEASEPANEL_RUNNER_PORT:-9000}}"
+
+if [ -n "${3:-}" ]; then
+    runner_url="${3}"
+elif [ -n "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}" ]; then
+    runner_url="${MANAGED_AGENT_RUNNER_PUBLIC_URL}"
+elif [ -n "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}" ]; then
+    runner_url="${RELEASEPANEL_RUNNER_PUBLIC_URL}"
+else
+    if [ -n "${public_ip}" ] && [ "${public_ip}" != "unknown" ]; then
+        runner_url="http://${public_ip}:${runner_port}"
+        printf '%s\n' "[managed-deploy-agent] Derived MANAGED_AGENT_RUNNER_PUBLIC_URL=${runner_url} from the same public IPv4 as registration (public_ip=${public_ip}; override with MANAGED_AGENT_RUNNER_PUBLIC_URL for tunnel/Tailscale/etc.)." >&2
+        if [ -z "${MANAGED_AGENT_RUNNER_HOST:-}" ] && [ -z "${RELEASEPANEL_RUNNER_HOST:-}" ]; then
+            export MANAGED_AGENT_RUNNER_HOST=0.0.0.0
+            export RELEASEPANEL_RUNNER_HOST=0.0.0.0
+            printf '%s\n' "[managed-deploy-agent] Using MANAGED_AGENT_RUNNER_HOST=0.0.0.0 so ${runner_url} is reachable (restrict port ${runner_port} in your firewall; override MANAGED_AGENT_RUNNER_HOST if needed)." >&2
+        fi
+    else
+        runner_url="http://127.0.0.1:${runner_port}"
+    fi
+fi
+
 runner_key="${MANAGED_AGENT_RUNNER_KEY:-${RELEASEPANEL_RUNNER_KEY:-}}"
 server_id="${MANAGED_AGENT_SERVER_ID:-${RELEASEPANEL_SERVER_ID:-}}"
+
+# Hosted SaaS panels historically rejected loopback in JSON — omit key so registration succeeds against older panel builds.
+hosted_panel_expects_routable_runner_url=false
+case "${panel_url_lc}" in
+    https://*)
+        hosted_panel_expects_routable_runner_url=true
+        case "${panel_url_lc}" in
+            https://localhost* | https://127.0.0.1* | https://\[::1\]* | https://::1* | https://[::1]*)
+                hosted_panel_expects_routable_runner_url=false
+                ;;
+        esac
+        ;;
+    http://*)
+        case "${panel_url_lc}" in
+            http://localhost* | http://127.0.0.1* | http://\[::1\]* | http://::1* | http://[::1]*)
+                ;;
+            *)
+                hosted_panel_expects_routable_runner_url=true
+                ;;
+        esac
+        ;;
+esac
+
+send_loopback_runner_in_json=false
+case "${MANAGED_AGENT_REGISTER_SEND_LOOPBACK_RUNNER_URL:-${RELEASEPANEL_REGISTER_SEND_LOOPBACK_RUNNER_URL:-}}" in
+    1 | true | TRUE | yes | YES | on | ON)
+        send_loopback_runner_in_json=true
+        ;;
+esac
+
+is_loopback_runner_url=false
+case "${runner_url}" in
+    http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*)
+        is_loopback_runner_url=true
+        ;;
+    http://\[::1\]*:* | https://\[::1\]*:* | http://[::1]*:* | https://[::1]*:*)
+        is_loopback_runner_url=true
+        ;;
+esac
+
+omit_runner_url_from_json=false
+if [ "${hosted_panel_expects_routable_runner_url}" = true ] && [ "${send_loopback_runner_in_json}" = false ] && [ "${is_loopback_runner_url}" = true ]; then
+    omit_runner_url_from_json=true
+    printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (hosted panel + loopback). Saas panels must not receive 127.0.0.1; pull the latest toolkit or set MANAGED_AGENT_RUNNER_PUBLIC_URL." >&2
+fi
+
+runner_public_url_for_env="${runner_url}"
+if [ "${is_loopback_runner_url}" = true ]; then
+    if [ -n "${public_ip}" ] && printf '%s\n' "${public_ip}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        runner_public_url_for_env="http://${public_ip}:${runner_port}"
+    fi
+fi
 
 if [ -z "${runner_key}" ] && [ -f "${RUNNER_ENV}" ]; then
     runner_key="$(grep -E '^MANAGED_AGENT_RUNNER_KEY=.' "${RUNNER_ENV}" | tail -n 1 | cut -d= -f2- || true)"
@@ -88,14 +211,12 @@ if [ -z "${runner_key}" ] || [ "${runner_key}" = "CHANGE_ME" ]; then
     runner_key="$(openssl rand -hex 32)"
 fi
 
-# Self-signed HTTPS panel: only mirror join-panel auto-insecure when curl fails *certificate verification* (60/51),
-# not transient connection errors during nginx reload (those must not write MANAGED_AGENT_PANEL_INSECURE_TLS=1).
 if [ -z "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-}" ] && [ -z "${RELEASEPANEL_REGISTER_INSECURE_TLS:-}" ]; then
     case "${MANAGED_AGENT_DISABLE_AUTO_INSECURE_TLS:-${RELEASEPANEL_DISABLE_AUTO_INSECURE_TLS:-}}" in
         1 | true | TRUE | yes | YES | on | ON)
             ;;
         *)
-            case "${panel_url}" in
+            case "${panel_url_lc}" in
                 https://*)
                     check_url="${panel_url%/}/api/runner-connectivity-check"
                     set +e
@@ -125,11 +246,8 @@ if [ -f "${RUNNER_ENV}" ]; then
     cp "${RUNNER_ENV}" "${RUNNER_ENV}.$(date +%Y%m%d%H%M%S).bak"
 fi
 
-# Read from the environment for this registration request only — never written to the agent .env
-# (account key is onboarding-only; runner key is long-term auth).
-panel_install_key="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-${RELEASEPANEL_PANEL_INSTALL_KEY:-}}}}}"
+panel_install_key="${MANAGED_AGENT_ACCOUNT_KEY:-${RELEASEPANEL_AGENT_ACCOUNT_KEY:-${MANAGED_AGENT_PANEL_INSTALL_KEY:-${RELEASEPANEL_INSTALL_KEY:-${RELEASEPANEL_PANEL_INSTALL_KEY:-}}}}}}"
 
-# Default outbound poll on: Prepare server, deploy, site create, SSL use POST /api/agent/poll.
 poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
 if [ -z "${poll_raw}" ]; then
     poll_raw=true
@@ -141,8 +259,7 @@ case "${poll_raw}" in
         ;;
 esac
 
-# reg_complete: 1 = final env after POST /api/register-runner (strip install key); 0 = staging so a
-# concurrently running agent can heartbeat-bootstrap with the install key before curl returns.
+# reg_complete 0 = staging .env so a running agent can heartbeat during join + register completes.
 write_runner_env() {
     local rk="$1"
     local reg_complete="$2"
@@ -152,8 +269,8 @@ write_runner_env() {
     {
         printf 'MANAGED_AGENT_RUNNER_HOST=%s\n' "${MANAGED_AGENT_RUNNER_HOST:-${RELEASEPANEL_RUNNER_HOST:-127.0.0.1}}"
         printf 'RELEASEPANEL_RUNNER_HOST=%s\n' "${RELEASEPANEL_RUNNER_HOST:-${MANAGED_AGENT_RUNNER_HOST:-127.0.0.1}}"
-        printf 'MANAGED_AGENT_RUNNER_PORT=9000\n'
-        printf 'RELEASEPANEL_RUNNER_PORT=9000\n'
+        printf 'MANAGED_AGENT_RUNNER_PORT=%s\n' "${runner_port}"
+        printf 'RELEASEPANEL_RUNNER_PORT=%s\n' "${runner_port}"
         printf 'MANAGED_AGENT_RUNNER_KEY=%s\n' "${rk}"
         printf 'RELEASEPANEL_RUNNER_KEY=%s\n' "${rk}"
         printf 'MANAGED_AGENT_RUNNER_LOG=/var/log/managed-deploy-agent.log\n'
@@ -164,8 +281,8 @@ write_runner_env() {
         printf 'RELEASEPANEL_RUNNER_DEPLOY_TIMEOUT_MS=900000\n'
         printf 'MANAGED_AGENT_PANEL_URL=%s\n' "${panel_url}"
         printf 'RELEASEPANEL_PANEL_URL=%s\n' "${panel_url}"
-        printf 'MANAGED_AGENT_RUNNER_PUBLIC_URL=%s\n' "${runner_url}"
-        printf 'RELEASEPANEL_RUNNER_PUBLIC_URL=%s\n' "${runner_url}"
+        printf 'MANAGED_AGENT_RUNNER_PUBLIC_URL=%s\n' "${runner_public_url_for_env}"
+        printf 'RELEASEPANEL_RUNNER_PUBLIC_URL=%s\n' "${runner_public_url_for_env}"
         printf 'MANAGED_AGENT_RUNNER_HEARTBEAT_MS=30000\n'
         printf 'RELEASEPANEL_RUNNER_HEARTBEAT_MS=30000\n'
         printf 'MANAGED_AGENT_SERVER_NAME=%s\n' "${server_name}"
@@ -209,18 +326,24 @@ write_runner_env() {
     fi
 }
 
-payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"runner_url":%s,"server_id":%s}' \
-    "$(quote_json "${server_name}")" \
-    "$(quote_json "${reported_hostname}")" \
-    "$(quote_json "${public_ip:-unknown}")" \
-    "$(quote_json "${runner_url}")" \
-    "$(quote_json "${server_id}")")"
+if [ "${omit_runner_url_from_json}" = true ]; then
+    payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"server_id":%s}' \
+        "$(quote_json "${server_name}")" \
+        "$(quote_json "${reported_hostname}")" \
+        "$(quote_json "${public_ip:-unknown}")" \
+        "$(quote_json "${server_id}")")"
+else
+    payload="$(printf '{"name":%s,"hostname":%s,"public_ip":%s,"runner_url":%s,"server_id":%s}' \
+        "$(quote_json "${server_name}")" \
+        "$(quote_json "${reported_hostname}")" \
+        "$(quote_json "${public_ip:-unknown}")" \
+        "$(quote_json "${runner_url}")" \
+        "$(quote_json "${server_id}")")"
+fi
 
-case "${runner_url}" in
-    http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*)
-        printf '%s\n' "[managed-deploy-agent] WARN: runner_url is ${runner_url}. The hosted panel cannot open that address from its own network. Set MANAGED_AGENT_RUNNER_PUBLIC_URL (tunnel, VPN URL, or http(s)://YOUR_PUBLIC_IP:9000 with bind 0.0.0.0 + firewall allowlist) then restart the agent. See docs/agent-panel-connection.md." >&2
-        ;;
-esac
+if [ "${is_loopback_runner_url}" = true ] && [ "${omit_runner_url_from_json}" != true ]; then
+    printf '%s\n' "[managed-deploy-agent] WARN: runner_url is ${runner_url}. The hosted panel cannot open that address from its own network. Set MANAGED_AGENT_RUNNER_PUBLIC_URL (tunnel, VPN URL, or http(s)://YOUR_PUBLIC_IP:9000 with bind 0.0.0.0 + firewall allowlist) then restart the agent. See docs/agent-panel-connection.md." >&2
+fi
 
 write_runner_env "${runner_key}" 0
 
