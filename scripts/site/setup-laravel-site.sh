@@ -122,6 +122,29 @@ pm.max_spare_servers = 4
 clear_env = no
 POOL_EOF
 
+if [ ! -d /etc/nginx/sites-available ] || [ ! -d /etc/nginx/sites-enabled ] || ! command -v nginx >/dev/null 2>&1; then
+  log "Installing nginx (site vhost requires /etc/nginx)"
+  export DEBIAN_FRONTEND=noninteractive
+  if [ ! -d /var/lib/apt/lists ] || [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null)" ]; then
+    log "Refreshing apt lists (nginx install)"
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-optimizations.sh"
+    if [ -f "${_lib}" ]; then
+      # shellcheck source=/dev/null
+      . "${_lib}"
+      command -v force_ipv4_apt >/dev/null 2>&1 && force_ipv4_apt || true
+      command -v configure_apt_timeouts >/dev/null 2>&1 && configure_apt_timeouts || true
+      command -v apply_detected_mirror >/dev/null 2>&1 && apply_detected_mirror || true
+      command -v clean_apt_cache_safe >/dev/null 2>&1 && clean_apt_cache_safe || true
+      command -v apt_update_safe >/dev/null 2>&1 && apt_update_safe || true
+    else
+      apt-get update -y || true
+    fi
+  fi
+  apt-get install -y --no-install-recommends nginx
+fi
+
+mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
 log "Nginx config: ${NGINX_AVAIL}"
 if [ -f "$NGINX_AVAIL" ] || [ -L "$NGINX_AVAIL" ]; then
   log "Nginx site config already exists; not overwriting"
