@@ -45,12 +45,11 @@ if msg:
 if hint:
     print(f"  hint: {hint}", file=sys.stderr)
 guides = {
-    "install_key_invalid": "Install key is wrong or unknown. In ReleasePanel: copy the current key from Connect server / Settings, or Rotate Install Key and use the new key.",
+    "install_key_invalid": "The panel received a full key that does not match your org (hash lookup failed). Open Settings → Rotate or copy the current install key, paste with no spaces or line breaks, and retry. If this copy was from Word/Slack/email, re-copy from the browser (CRLF and hidden characters cause this).",
     "install_key_exhausted": "This install key was already used (single-use). Rotate Install Key in ReleasePanel, then re-run install or: managed-deploy join <panel-url> --account-key=<NEW_KEY>",
     "install_key_expired": "Install key expired. Rotate Install Key in ReleasePanel and try again.",
     "account_install_key_required": "Panel requires an install key but none was sent. Pass --account-key= on install or export MANAGED_AGENT_ACCOUNT_KEY before join.",
     "account_install_key_mismatch": "Key does not match this account. Confirm you copied the key for the correct organization.",
-    "install_key_invalid": "The panel received a full key that does not match your org (hash lookup failed). Open Settings → Rotate or copy the current install key, paste with no spaces or line breaks, and retry. If this copy was from Word/Slack/email, re-copy from the browser (CRLF and hidden characters cause this).",
     "runner_url_loopback_rejected": "Your installer is stale or still sending 127.0.0.1 as runner_url. On the VPS: cd /opt/managed-deploy-agent && git pull && git -C toolkit pull origin main (or reinstall), then retry join — or upgrade app.releasepanel.com to the latest releasepanel-app.",
 }
 g = guides.get(code)
@@ -96,9 +95,14 @@ case "${panel_url_lc}" in
         ;;
 esac
 
+releasepanel_trim_str() {
+    python3 -c 'import sys; print(sys.argv[1].strip())' "${1:-}" 2>/dev/null || printf '%s' "${1:-}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
 releasepanel_is_loopback_agent_runner_url() {
-    local lc
-    lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    local lc raw
+    raw="$(releasepanel_trim_str "${1:-}")"
+    lc="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]')"
     case "${lc}" in
         '') return 1 ;;
         http://127.0.0.1* | http://localhost* | https://127.0.0.1* | https://localhost*) return 0 ;;
@@ -107,19 +111,21 @@ releasepanel_is_loopback_agent_runner_url() {
     esac
 }
 
-MANAGED_AGENT_RUNNER_PUBLIC_URL="${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}"
-RELEASEPANEL_RUNNER_PUBLIC_URL="${RELEASEPANEL_RUNNER_PUBLIC_URL:-}"
+MANAGED_AGENT_RUNNER_PUBLIC_URL="$(releasepanel_trim_str "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}")"
+RELEASEPANEL_RUNNER_PUBLIC_URL="$(releasepanel_trim_str "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}")"
 MANAGED_AGENT_RUNNER_PUBLIC_URL="${MANAGED_AGENT_RUNNER_PUBLIC_URL//$'\r'/}"
 RELEASEPANEL_RUNNER_PUBLIC_URL="${RELEASEPANEL_RUNNER_PUBLIC_URL//$'\r'/}"
 
 if [ "${hosted_panel_expects_routable_runner_url}" = true ]; then
     if releasepanel_is_loopback_agent_runner_url "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}"; then
-        printf '%s\n' "[managed-deploy-agent] Ignoring stale loopback MANAGED_AGENT_RUNNER_PUBLIC_URL (${MANAGED_AGENT_RUNNER_PUBLIC_URL}) for hosted HTTPS panel — deriving runner_url from egress IP or omitting from JSON instead." >&2
+        printf '%s\n' "[managed-deploy-agent] Ignoring stale loopback MANAGED_AGENT_RUNNER_PUBLIC_URL (${MANAGED_AGENT_RUNNER_PUBLIC_URL}) for hosted HTTPS panel — use derived egress URL for registration JSON instead." >&2
         MANAGED_AGENT_RUNNER_PUBLIC_URL=""
+        export MANAGED_AGENT_RUNNER_PUBLIC_URL
     fi
     if releasepanel_is_loopback_agent_runner_url "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}"; then
         printf '%s\n' "[managed-deploy-agent] Ignoring stale loopback RELEASEPANEL_RUNNER_PUBLIC_URL (${RELEASEPANEL_RUNNER_PUBLIC_URL})." >&2
         RELEASEPANEL_RUNNER_PUBLIC_URL=""
+        export RELEASEPANEL_RUNNER_PUBLIC_URL
     fi
 fi
 
@@ -204,7 +210,7 @@ runner_port="${MANAGED_AGENT_RUNNER_PORT:-${RELEASEPANEL_RUNNER_PORT:-9000}}"
 
 runner_url=""
 if [ -n "${3:-}" ]; then
-    runner_url="${3}"
+    runner_url="$(releasepanel_trim_str "${3}")"
 elif [ -n "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}" ]; then
     runner_url="${MANAGED_AGENT_RUNNER_PUBLIC_URL}"
 elif [ -n "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}" ]; then
@@ -221,6 +227,10 @@ else
     else
         runner_url=""
     fi
+fi
+
+if [ -n "${runner_url}" ]; then
+    runner_url="$(releasepanel_trim_str "${runner_url}")"
 fi
 
 runner_key="${MANAGED_AGENT_RUNNER_KEY:-${RELEASEPANEL_RUNNER_KEY:-}}"
@@ -250,8 +260,12 @@ if [ "${send_loopback_runner_in_json}" != true ]; then
         printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (no routable agent IPv4 / no MANAGED_AGENT_RUNNER_PUBLIC_URL)." >&2
     elif [ "${hosted_panel_expects_routable_runner_url}" = true ] && [ "${is_loopback_runner_url}" = true ]; then
         omit_runner_url_from_json=true
-        printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (hosted panel + loopback MANAGED_AGENT_RUNNER_PUBLIC_URL)." >&2
+        printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (hosted HTTPS panel cannot use loopback runner endpoint: ${runner_url}). Unset MANAGED_AGENT_RUNNER_PUBLIC_URL or update toolkit: git pull in /opt/managed-deploy-agent and toolkit)." >&2
     fi
+fi
+
+if [ "${omit_runner_url_from_json}" != true ] && [ -n "${runner_url}" ]; then
+    printf '%s\n' "[managed-deploy-agent] Including runner_url in registration JSON (${runner_url})." >&2
 fi
 
 runner_public_url_for_env="${runner_url}"
