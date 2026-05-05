@@ -76,55 +76,83 @@ panel_url_lc="$(printf '%s' "${panel_url}" | tr '[:upper:]' '[:lower:]')"
 server_name="${2:-${MANAGED_AGENT_SERVER_NAME:-${RELEASEPANEL_SERVER_NAME:-$(hostname -f 2>/dev/null || hostname)}}}"
 reported_hostname="$(hostname -f 2>/dev/null || hostname)"
 
-# Public egress IPv4 only: curl -4 + IPv4 text endpoints first; optional link-local cloud metadata fallbacks last.
+# Agent-side public IPv4 for registration (panel must not infer from TCP source — proxies/CDN break request()->ip()).
+# Accept only globally routable IPv4 (Python ipaddress.is_global — excludes 10/8, RFC1918, CGNAT, loopback, etc.).
+releasepanel_is_routable_agent_ipv4() {
+    python3 -c '
+import ipaddress, sys
+raw = sys.argv[1].strip()
+try:
+    addr = ipaddress.ip_address(raw)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if addr.version == 4 and addr.is_global else 1)
+' "$1" 2>/dev/null
+}
+
 releasepanel_probe_public_ipv4() {
     printf '%s' "$(
         curl -4fsS --connect-timeout 10 --max-time 20 "${1}" 2>/dev/null || true
     )" | tr -d '[:space:]'
 }
 
-public_ip=""
+runner_explicit=false
+if [ -n "${3:-}" ] || [ -n "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}" ] || [ -n "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}" ]; then
+    runner_explicit=true
+fi
+
+detected_public_ipv4=""
 for _probe_url in \
-    "https://api4.ipify.org" \
-    "https://ipv4.icanhazip.com" \
+    "https://api.ipify.org" \
+    "https://ifconfig.me/ip" \
     "https://checkip.amazonaws.com" \
-    "https://ifconfig.me/ip"; do
+    "https://api4.ipify.org" \
+    "https://ipv4.icanhazip.com"; do
     candidate="$(releasepanel_probe_public_ipv4 "${_probe_url}")"
-    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        public_ip="${candidate}"
+    if [ -n "${candidate}" ] && releasepanel_is_routable_agent_ipv4 "${candidate}"; then
+        detected_public_ipv4="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Detected public IP for runner_url: ${detected_public_ipv4}" >&2
         break
     fi
 done
 
-if [ -z "${public_ip}" ]; then
+if [ -z "${detected_public_ipv4}" ]; then
     candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || true)"
     candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
-    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        public_ip="${candidate}"
-        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via metadata (169.254.169.254)." >&2
+    if [ -n "${candidate}" ] && releasepanel_is_routable_agent_ipv4 "${candidate}"; then
+        detected_public_ipv4="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Detected public IP for runner_url: ${detected_public_ipv4} (cloud metadata)." >&2
     fi
 fi
-if [ -z "${public_ip}" ]; then
+if [ -z "${detected_public_ipv4}" ]; then
     candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 \
         -H "Metadata-Flavor: Google" \
         "http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 2>/dev/null || true)"
     candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
-    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        public_ip="${candidate}"
-        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via GCP metadata." >&2
+    if [ -n "${candidate}" ] && releasepanel_is_routable_agent_ipv4 "${candidate}"; then
+        detected_public_ipv4="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Detected public IP for runner_url: ${detected_public_ipv4} (GCP metadata)." >&2
     fi
 fi
-if [ -z "${public_ip}" ]; then
+if [ -z "${detected_public_ipv4}" ]; then
     candidate="$(curl -4fsS --connect-timeout 1 --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
     candidate="$(printf '%s' "${candidate}" | tr -d '[:space:]')"
-    if [ -n "${candidate}" ] && printf '%s\n' "${candidate}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        public_ip="${candidate}"
-        printf '%s\n' "[managed-deploy-agent] Discovered public IPv4 via EC2-compatible metadata." >&2
+    if [ -n "${candidate}" ] && releasepanel_is_routable_agent_ipv4 "${candidate}"; then
+        detected_public_ipv4="${candidate}"
+        printf '%s\n' "[managed-deploy-agent] Detected public IP for runner_url: ${detected_public_ipv4} (EC2-compatible metadata)." >&2
     fi
 fi
+
+if [ -z "${detected_public_ipv4}" ]; then
+    printf '%s\n' "[managed-deploy-agent] Unable to determine a routable public IPv4 for runner_url (set MANAGED_AGENT_RUNNER_PUBLIC_URL or configure outbound HTTPS to ipify/ifconfig.me)." >&2
+fi
+
+# JSON public_ip field: same detection (unknown if we could not learn egress — panel may still accept registration without runner_url).
+public_ip="${detected_public_ipv4}"
 
 runner_port="${MANAGED_AGENT_RUNNER_PORT:-${RELEASEPANEL_RUNNER_PORT:-9000}}"
 
+runner_url=""
 if [ -n "${3:-}" ]; then
     runner_url="${3}"
 elif [ -n "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}" ]; then
@@ -132,23 +160,23 @@ elif [ -n "${MANAGED_AGENT_RUNNER_PUBLIC_URL:-}" ]; then
 elif [ -n "${RELEASEPANEL_RUNNER_PUBLIC_URL:-}" ]; then
     runner_url="${RELEASEPANEL_RUNNER_PUBLIC_URL}"
 else
-    if [ -n "${public_ip}" ] && [ "${public_ip}" != "unknown" ]; then
-        runner_url="http://${public_ip}:${runner_port}"
-        printf '%s\n' "[managed-deploy-agent] Derived MANAGED_AGENT_RUNNER_PUBLIC_URL=${runner_url} from the same public IPv4 as registration (public_ip=${public_ip}; override with MANAGED_AGENT_RUNNER_PUBLIC_URL for tunnel/Tailscale/etc.)." >&2
+    if [ -n "${detected_public_ipv4}" ]; then
+        runner_url="http://${detected_public_ipv4}:${runner_port}"
+        printf '%s\n' "[managed-deploy-agent] Using agent-derived runner_url=${runner_url} (override with MANAGED_AGENT_RUNNER_PUBLIC_URL for tunnel/Tailscale)." >&2
         if [ -z "${MANAGED_AGENT_RUNNER_HOST:-}" ] && [ -z "${RELEASEPANEL_RUNNER_HOST:-}" ]; then
             export MANAGED_AGENT_RUNNER_HOST=0.0.0.0
             export RELEASEPANEL_RUNNER_HOST=0.0.0.0
-            printf '%s\n' "[managed-deploy-agent] Using MANAGED_AGENT_RUNNER_HOST=0.0.0.0 so ${runner_url} is reachable (restrict port ${runner_port} in your firewall; override MANAGED_AGENT_RUNNER_HOST if needed)." >&2
+            printf '%s\n' "[managed-deploy-agent] Using MANAGED_AGENT_RUNNER_HOST=0.0.0.0 so the panel can reach ${runner_url} (restrict port ${runner_port} in your firewall)." >&2
         fi
     else
-        runner_url="http://127.0.0.1:${runner_port}"
+        runner_url=""
     fi
 fi
 
 runner_key="${MANAGED_AGENT_RUNNER_KEY:-${RELEASEPANEL_RUNNER_KEY:-}}"
 server_id="${MANAGED_AGENT_SERVER_ID:-${RELEASEPANEL_SERVER_ID:-}}"
 
-# Hosted SaaS panels historically rejected loopback in JSON — omit key so registration succeeds against older panel builds.
+# Omit runner_url JSON when empty (no localhost default) or when hosted panel cannot use loopback.
 hosted_panel_expects_routable_runner_url=false
 case "${panel_url_lc}" in
     https://*)
@@ -188,15 +216,26 @@ case "${runner_url}" in
 esac
 
 omit_runner_url_from_json=false
-if [ "${hosted_panel_expects_routable_runner_url}" = true ] && [ "${send_loopback_runner_in_json}" = false ] && [ "${is_loopback_runner_url}" = true ]; then
-    omit_runner_url_from_json=true
-    printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (hosted panel + loopback). Saas panels must not receive 127.0.0.1; pull the latest toolkit or set MANAGED_AGENT_RUNNER_PUBLIC_URL." >&2
+if [ "${send_loopback_runner_in_json}" != true ]; then
+    if [ -z "${runner_url}" ]; then
+        omit_runner_url_from_json=true
+        printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (no routable agent IPv4 / no MANAGED_AGENT_RUNNER_PUBLIC_URL)." >&2
+    elif [ "${hosted_panel_expects_routable_runner_url}" = true ] && [ "${is_loopback_runner_url}" = true ]; then
+        omit_runner_url_from_json=true
+        printf '%s\n' "[managed-deploy-agent] Omitting runner_url from registration JSON (hosted panel + loopback MANAGED_AGENT_RUNNER_PUBLIC_URL)." >&2
+    fi
 fi
 
 runner_public_url_for_env="${runner_url}"
-if [ "${is_loopback_runner_url}" = true ]; then
-    if [ -n "${public_ip}" ] && printf '%s\n' "${public_ip}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-        runner_public_url_for_env="http://${public_ip}:${runner_port}"
+if [ "${runner_explicit}" != true ]; then
+    if [ -n "${detected_public_ipv4}" ]; then
+        runner_public_url_for_env="http://${detected_public_ipv4}:${runner_port}"
+    elif [ -z "${runner_url}" ]; then
+        runner_public_url_for_env=""
+    fi
+else
+    if [ "${is_loopback_runner_url}" = true ] && [ -n "${detected_public_ipv4}" ]; then
+        runner_public_url_for_env="http://${detected_public_ipv4}:${runner_port}"
     fi
 fi
 
@@ -283,6 +322,10 @@ write_runner_env() {
         printf 'RELEASEPANEL_PANEL_URL=%s\n' "${panel_url}"
         printf 'MANAGED_AGENT_RUNNER_PUBLIC_URL=%s\n' "${runner_public_url_for_env}"
         printf 'RELEASEPANEL_RUNNER_PUBLIC_URL=%s\n' "${runner_public_url_for_env}"
+        if [ -n "${detected_public_ipv4:-}" ]; then
+            printf 'MANAGED_AGENT_RUNNER_PUBLIC_IP=%s\n' "${detected_public_ipv4}"
+            printf 'RELEASEPANEL_RUNNER_PUBLIC_IP=%s\n' "${detected_public_ipv4}"
+        fi
         printf 'MANAGED_AGENT_RUNNER_HEARTBEAT_MS=30000\n'
         printf 'RELEASEPANEL_RUNNER_HEARTBEAT_MS=30000\n'
         printf 'MANAGED_AGENT_SERVER_NAME=%s\n' "${server_name}"

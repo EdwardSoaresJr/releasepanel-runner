@@ -78,6 +78,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const os = require('os');
 const https = require('https');
+const net = require('net');
 const crypto = require('crypto');
 const { URL } = require('url');
 const { spawn, spawnSync } = require('child_process');
@@ -209,6 +210,107 @@ const pollIntervalMs = Math.max(
     Number.parseInt(envPair('MANAGED_AGENT_POLL_INTERVAL_SECONDS', 'RELEASEPANEL_POLL_INTERVAL_SECONDS', '5'), 10) * 1000,
 );
 const panelInsecureTls = envTruthy('MANAGED_AGENT_PANEL_INSECURE_TLS', 'RELEASEPANEL_PANEL_INSECURE_TLS');
+
+/** In-process cache: `undefined` = not attempted yet, string = IPv4, `null` = lookup failed */
+let cachedDetectedPublicIpv4;
+
+/**
+ * Match bash `releasepanel_is_routable_agent_ipv4` / Python `IPv4Address.is_global` closely enough for agent self-reporting.
+ * @param {unknown} ip
+ * @returns {boolean}
+ */
+function isRoutablePublicIpv4(ip) {
+    if (typeof ip !== 'string') {
+        return false;
+    }
+    const s = ip.trim();
+    if (!net.isIPv4(s)) {
+        return false;
+    }
+    const oct = s.split('.').map((x) => Number.parseInt(x, 10));
+    if (oct.some((n) => n > 255 || n < 0 || Number.isNaN(n))) {
+        return false;
+    }
+    const [a, b, c] = oct;
+    if (a === 0 || a === 10 || a === 127) {
+        return false;
+    }
+    if (a === 169 && b === 254) {
+        return false;
+    }
+    if (a === 172 && b >= 16 && b <= 31) {
+        return false;
+    }
+    if (a === 192 && b === 168) {
+        return false;
+    }
+    if (a === 100 && b >= 64 && b <= 127) {
+        return false;
+    }
+    if (a === 192 && b === 0 && c === 0) {
+        return false;
+    }
+    if (a === 192 && b === 0 && c === 2) {
+        return false;
+    }
+    if (a === 198 && b === 51 && c === 100) {
+        return false;
+    }
+    if (a === 203 && b === 0 && c === 113) {
+        return false;
+    }
+    if (a === 198 && b >= 18 && b <= 19) {
+        return false;
+    }
+    if (a >= 224) {
+        return false;
+    }
+    return true;
+}
+
+async function fetchTextProbe(url, timeoutMs = 12000) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            signal: ac.signal,
+            headers: { Accept: 'text/plain,*/*' },
+        });
+        clearTimeout(timer);
+        if (!res.ok) {
+            return '';
+        }
+        return (await res.text()).trim();
+    } catch {
+        clearTimeout(timer);
+        return '';
+    }
+}
+
+async function detectPublicIpv4ForRunner() {
+    if (cachedDetectedPublicIpv4 !== undefined) {
+        return cachedDetectedPublicIpv4;
+    }
+    const urls = [
+        'https://api.ipify.org',
+        'https://ifconfig.me/ip',
+        'https://checkip.amazonaws.com',
+        'https://api4.ipify.org',
+    ];
+    for (const url of urls) {
+        const raw = await fetchTextProbe(url);
+        const ip = (raw.split(/\s/)[0] || '').trim();
+        if (isRoutablePublicIpv4(ip)) {
+            console.error(`[managed-deploy-agent] Detected public IP for runner_url: ${ip}`);
+            cachedDetectedPublicIpv4 = ip;
+            return ip;
+        }
+    }
+    console.error('[managed-deploy-agent] Unable to determine public IP for runner');
+    cachedDetectedPublicIpv4 = null;
+    return null;
+}
+
 const runningEnvActions = new Map();
 const commandRuns = new Map();
 const maxTailBytes = 256 * 1024;
@@ -408,7 +510,11 @@ function installedPhpVersions() {
 }
 
 function healthContract() {
-    const publicIp = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '');
+    let publicIp = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '');
+    publicIp = publicIp && isRoutablePublicIpv4(publicIp) ? publicIp : '';
+    if (!publicIp && typeof cachedDetectedPublicIpv4 === 'string') {
+        publicIp = cachedDetectedPublicIpv4;
+    }
     const gitRevision = readGitRevisionShort();
     const version = resolvedRunnerVersionLabel();
 
@@ -521,16 +627,31 @@ async function sendHeartbeat() {
 
     try {
         const heartbeatPayload = {
-            public_ip: envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', null) || null,
             hostname: os.hostname(),
         };
 
         const explicitPublicUrl = envPair('MANAGED_AGENT_RUNNER_PUBLIC_URL', 'RELEASEPANEL_RUNNER_PUBLIC_URL', '').trim();
-        const pip = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '').trim();
+        const envPip = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '').trim();
+        const routableEnvPip = envPip && isRoutablePublicIpv4(envPip) ? envPip : '';
+
+        /** Only probe when panel URL is unset or would be wrong — respect explicit MANAGED_AGENT_RUNNER_PUBLIC_URL */
+        let detected = null;
+        if (explicitPublicUrl === '' && !routableEnvPip) {
+            detected = await detectPublicIpv4ForRunner();
+        }
+
+        if (routableEnvPip) {
+            heartbeatPayload.public_ip = routableEnvPip;
+        } else if (detected) {
+            heartbeatPayload.public_ip = detected;
+        }
+
         if (explicitPublicUrl !== '') {
             heartbeatPayload.runner_url = explicitPublicUrl;
-        } else if (host !== '127.0.0.1' && pip !== '') {
-            heartbeatPayload.runner_url = `http://${pip}:${port}`;
+        } else if (routableEnvPip) {
+            heartbeatPayload.runner_url = `http://${routableEnvPip}:${port}`;
+        } else if (detected) {
+            heartbeatPayload.runner_url = `http://${detected}:${port}`;
         }
 
         const displayName = envPair('MANAGED_AGENT_SERVER_NAME', 'RELEASEPANEL_SERVER_NAME', '');
