@@ -2299,12 +2299,13 @@ app.get('/ops/:site/:env/backups', requireApiKey, (request, response) => {
     readOpsBackups(request, response);
 });
 
-app.get('/env/:site/:env', requireApiKey, (request, response) => {
+// Remote Laravel shared/.env for a toolkit site (ReleasePanel: GET/PUT /api/.../laravel-env → /env/{site}/{env}).
+app.get('/env/:site/:env', validateSiteEnv, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     readSharedEnv(request, response);
 });
 
-app.put('/env/:site/:env', requireApiKey, (request, response) => {
+app.put('/env/:site/:env', validateSiteEnv, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     writeSharedEnv(request, response);
 });
