@@ -952,6 +952,40 @@ function isSafeSlug(value) {
     return /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value) || /^[A-Za-z0-9]$/.test(value);
 }
 
+/**
+ * Path-safe segment for GET/PUT /env/:site/:env only.
+ * Looser than {@link isSafeSlug} so legitimate panel slugs are not rejected with HTTP 400,
+ * while still blocking traversal and control characters.
+ */
+function isEnvRouteSegment(value) {
+    if (typeof value !== 'string' || value === '' || value.length > 128) {
+        return false;
+    }
+    if (value.includes('..') || /[\0\/\\]/.test(value)) {
+        return false;
+    }
+
+    return true;
+}
+
+function validateEnvSitePath(request, response, next) {
+    const site = request.params.site;
+    const env = request.params.env;
+
+    if (!isEnvRouteSegment(site) || !isEnvRouteSegment(env)) {
+        response.status(400).json({
+            success: false,
+            exit_code: 1,
+            stdout: '',
+            stderr: `Invalid site/environment: ${site}/${env}`,
+            duration_ms: 0,
+        });
+        return;
+    }
+
+    next();
+}
+
 function sharedEnvPath(env) {
     return `${environmentBasePath(env)}/shared/.env`;
 }
@@ -2637,12 +2671,13 @@ app.get('/ops/:site/:env/backups', requireApiKey, (request, response) => {
 });
 
 // Remote Laravel shared/.env for a toolkit site (ReleasePanel: GET/PUT /api/.../laravel-env → /env/{site}/{env}).
-app.get('/env/:site/:env', validateSiteEnv, (request, response) => {
+// Use validateEnvSitePath (not validateSiteEnv) so slugs are not rejected with 400; missing file is 200 + empty contents in readSharedEnv.
+app.get('/env/:site/:env', validateEnvSitePath, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     readSharedEnv(request, response);
 });
 
-app.put('/env/:site/:env', validateSiteEnv, (request, response) => {
+app.put('/env/:site/:env', validateEnvSitePath, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     writeSharedEnv(request, response);
 });
