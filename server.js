@@ -938,8 +938,18 @@ function validatePromote(request, response, next) {
     next();
 }
 
+/**
+ * Single URL path segment for site or env slug (also used in sites/site/env compound keys).
+ * Allows dots for domain-style slugs; rejects empty, "..", and overlong values.
+ */
 function isSafeSlug(value) {
-    return /^[A-Za-z0-9_-]+$/.test(value || '');
+    if (typeof value !== 'string' || value === '') {
+        return false;
+    }
+    if (value.length > 80 || value.includes('..')) {
+        return false;
+    }
+    return /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value) || /^[A-Za-z0-9]$/.test(value);
 }
 
 function sharedEnvPath(env) {
@@ -1602,6 +1612,28 @@ function readSharedEnv(request, response) {
         const durationMs = Date.now() - startedAt;
 
         if (error) {
+            // Missing shared/.env is normal before first deploy — panel expects HTTP 2xx + success + empty contents.
+            if (error.code === 'ENOENT') {
+                appendLog({
+                    method: request.method,
+                    path: request.path,
+                    env,
+                    action: 'env.read',
+                    requester_ip: requesterIp(request),
+                    success: true,
+                    duration_ms: durationMs,
+                    message: 'shared .env not created yet (ok)',
+                });
+
+                response.json({
+                    success: true,
+                    environment: env,
+                    path: filePath,
+                    contents: '',
+                });
+                return;
+            }
+
             appendLog({
                 method: request.method,
                 path: request.path,
@@ -1613,9 +1645,9 @@ function readSharedEnv(request, response) {
                 message: error.message,
             });
 
-            response.status(error.code === 'ENOENT' ? 404 : 500).json({
+            response.status(500).json({
                 success: false,
-                message: error.code === 'ENOENT' ? `${filePath} does not exist.` : error.message,
+                message: error.message,
                 path: filePath,
             });
             return;
