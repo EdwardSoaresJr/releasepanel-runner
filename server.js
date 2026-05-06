@@ -1725,16 +1725,29 @@ function writeSharedEnv(request, response) {
     const env = request.params.env;
     const filePath = sharedEnvPath(env);
     logEnvPathDebug('write', env, filePath);
-    const contents = request.body?.contents;
-    const startedAt = Date.now();
 
-    if (typeof contents !== 'string') {
-        response.status(422).json({
-            success: false,
-            message: 'contents must be a string.',
-        });
-        return;
+    const body = request.body;
+    let contents;
+    if (body == null || typeof body !== 'object') {
+        contents = '';
+    } else if (!Object.prototype.hasOwnProperty.call(body, 'contents')) {
+        contents = '';
+    } else {
+        const raw = body.contents;
+        if (raw === undefined || raw === null) {
+            contents = '';
+        } else if (typeof raw === 'string') {
+            contents = raw;
+        } else {
+            response.status(422).json({
+                success: false,
+                message: 'contents must be a string.',
+            });
+            return;
+        }
     }
+
+    const startedAt = Date.now();
 
     if (contents.length > 128 * 1024) {
         response.status(413).json({
