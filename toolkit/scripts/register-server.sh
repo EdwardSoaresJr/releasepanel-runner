@@ -2,23 +2,52 @@
 # Registers this host with the panel (POST /api/register-runner) and writes agent .env only after success.
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RUNNER_HOME="$(
-    export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT_DIR}"
-    export RELEASEPANEL_RUNNER_DIR="${RELEASEPANEL_RUNNER_DIR:-}"
-    # shellcheck source=../lib/common.sh
-    . "${TOOLKIT_DIR}/lib/common.sh"
-    releasepanel_resolve_runner_directory
-)"
-RUNNER_ENV="${RUNNER_HOME}/.env"
-
 fail() {
     printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2
     exit 1
 }
 
-# Print panel JSON (code/message/hint) to stderr; works for install-key and other registration errors.
+TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR:-}"
+if [ -z "${TOOLKIT_DIR}" ]; then
+    case "${0}" in
+        /*)
+            TOOLKIT_DIR="$(cd "$(dirname "${0}")/.." && pwd)"
+            export RELEASEPANEL_TOOLKIT_DIR="${TOOLKIT_DIR}"
+            ;;
+        *)
+            fail "RELEASEPANEL_TOOLKIT_DIR is not set. Re-run the installer or run: bash /full/path/to/toolkit/scripts/register-server.sh …"
+            ;;
+    esac
+fi
+[ -d "${TOOLKIT_DIR}/scripts" ] || fail "RELEASEPANEL_TOOLKIT_DIR must be the toolkit root (got ${TOOLKIT_DIR})."
+
+# Resolve runner directory (same rules as toolkit/lib/common.sh releasepanel_resolve_runner_directory) without sourcing lib.
+register_server_resolve_runner_home() {
+    if [ -n "${RELEASEPANEL_RUNNER_DIR:-}" ] && [ -f "${RELEASEPANEL_RUNNER_DIR}/server.js" ]; then
+        cd "${RELEASEPANEL_RUNNER_DIR}" && pwd
+        return
+    fi
+    local opt_public="/opt/releasepanel-runner"
+    if [ -f "${opt_public}/server.js" ]; then
+        printf '%s\n' "${opt_public}"
+        return
+    fi
+    local sibling="${TOOLKIT_DIR}/../releasepanel-runner"
+    if [ -f "${sibling}/server.js" ]; then
+        cd "${sibling}" && pwd
+        return
+    fi
+    if [ -f "${TOOLKIT_DIR}/../server.js" ]; then
+        cd "${TOOLKIT_DIR}/.." && pwd
+        return
+    fi
+    printf '%s\n' "${TOOLKIT_DIR}/runner"
+}
+
+RUNNER_HOME="$(register_server_resolve_runner_home)"
+RUNNER_ENV="${RUNNER_HOME}/.env"
+
+# Print panel JSON (code/message/hint) to stderr for registration errors.
 registration_error_to_stderr() {
     local http_code="$1"
     local body="$2"
@@ -334,6 +363,12 @@ if [ -n "${panel_install_key}" ] && command -v python3 >/dev/null 2>&1; then
     panel_install_key="$(python3 -c 'import sys; print(sys.argv[1].strip())' "${panel_install_key}")"
 fi
 
+panel_join_token="${MANAGED_AGENT_JOIN_TOKEN:-${RELEASEPANEL_JOIN_TOKEN:-}}"
+panel_join_token="${panel_join_token//$'\r'/}"
+if [ -n "${panel_join_token}" ] && command -v python3 >/dev/null 2>&1; then
+    panel_join_token="$(python3 -c 'import sys; print(sys.argv[1].strip())' "${panel_join_token}")"
+fi
+
 poll_raw="${MANAGED_AGENT_POLL_ENABLED:-${RELEASEPANEL_POLL_ENABLED:-}}"
 if [ -z "${poll_raw}" ]; then
     poll_raw=true
@@ -397,7 +432,7 @@ write_runner_env() {
                 printf 'RELEASEPANEL_PANEL_INSECURE_TLS=1\n'
                 ;;
         esac
-        if [ "${reg_complete}" != "1" ] && [ -n "${panel_install_key}" ]; then
+        if [ "${reg_complete}" != "1" ] && [ -n "${panel_install_key}" ] && [ -z "${panel_join_token}" ]; then
             printf 'MANAGED_AGENT_ACCOUNT_KEY=%s\n' "${panel_install_key}"
             printf 'RELEASEPANEL_PANEL_INSTALL_KEY=%s\n' "${panel_install_key}"
         fi
@@ -446,7 +481,10 @@ case "${MANAGED_AGENT_REGISTER_INSECURE_TLS:-${RELEASEPANEL_REGISTER_INSECURE_TL
         echo "[managed-deploy-agent] WARNING: insecure TLS enabled for this registration request (private CA / untrusted panel certificate only)." >&2
         ;;
 esac
-if [ -n "${panel_install_key}" ]; then
+if [ -n "${panel_join_token}" ]; then
+    reg_hdrs+=(-H "X-JOIN-TOKEN: ${panel_join_token}")
+fi
+if [ -n "${panel_install_key}" ] && [ -z "${panel_join_token}" ]; then
     reg_hdrs+=(-H "X-ACCOUNT-INSTALL-KEY: ${panel_install_key}")
     reg_hdrs+=(-H "X-RELEASEPANEL-INSTALL-KEY: ${panel_install_key}")
 fi
@@ -492,6 +530,6 @@ case "${http_code}" in
         ;;
     *)
         registration_error_to_stderr "${http_code}" "${body}"
-        fail "Registration failed (HTTP ${http_code}). See the details above (especially code: install_key_*)."
+        fail "Registration failed (HTTP ${http_code}). See the details above (panel message/code)."
         ;;
 esac

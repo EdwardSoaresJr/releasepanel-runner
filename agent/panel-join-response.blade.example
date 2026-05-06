@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PANEL_URL="{{ url('/') }}"
+JOIN_TOKEN="{{ $token }}"
+
+PANEL_URL="${PANEL_URL%/}"
+
+echo "[releasepanel] Installing managed deploy agent..."
+
+INSTALL_URL="$PANEL_URL/agent/install.sh"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required"
+  exit 1
+fi
+
+curl -fsSL "$INSTALL_URL" | bash -s -- \
+  --panel-url="$PANEL_URL" \
+  --join-token="$JOIN_TOKEN"

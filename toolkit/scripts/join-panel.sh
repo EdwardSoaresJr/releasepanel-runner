@@ -2,17 +2,30 @@
 # Explicit "join control plane" entrypoint for remote VPS (calls register-server.sh after a reachability probe).
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 fail() {
     printf '[join-panel] error: %s\n' "$*" >&2
     exit 1
 }
 
+if [ -z "${RELEASEPANEL_TOOLKIT_DIR:-}" ]; then
+    case "${0}" in
+        /*)
+            RELEASEPANEL_TOOLKIT_DIR="$(cd "$(dirname "${0}")/.." && pwd)"
+            export RELEASEPANEL_TOOLKIT_DIR
+            ;;
+        *)
+            fail "Set RELEASEPANEL_TOOLKIT_DIR or run: bash /full/path/to/toolkit/scripts/join-panel.sh …"
+            ;;
+    esac
+fi
+
+TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR}"
+[ -d "${TOOLKIT_DIR}/scripts" ] || fail "RELEASEPANEL_TOOLKIT_DIR must be the toolkit root (got ${TOOLKIT_DIR})"
+
 panel_url=""
 positional=""
-# Normalize install key once (Windows clipboard CR, leading/trailing whitespace).
-releasepanel_normalize_account_install_arg() {
+# Normalize token / legacy org key once (Windows clipboard CR, leading/trailing whitespace).
+releasepanel_normalize_secret_arg() {
     local k="$1"
     k="${k//$'\r'/}"
     if command -v python3 >/dev/null 2>&1; then
@@ -28,8 +41,14 @@ while [ "$#" -gt 0 ]; do
             panel_url="${1#*=}"
             shift
             ;;
-        --account-key=* | --install-key=*)
-            k="$(releasepanel_normalize_account_install_arg "${1#*=}")"
+        --join-token=*)
+            k="$(releasepanel_normalize_secret_arg "${1#*=}")"
+            export MANAGED_AGENT_JOIN_TOKEN="${k}"
+            export RELEASEPANEL_JOIN_TOKEN="${k}"
+            shift
+            ;;
+        --account-key=*)
+            k="$(releasepanel_normalize_secret_arg "${1#*=}")"
             export MANAGED_AGENT_ACCOUNT_KEY="${k}"
             export RELEASEPANEL_AGENT_ACCOUNT_KEY="${k}"
             export MANAGED_AGENT_PANEL_INSTALL_KEY="${k}"
@@ -54,7 +73,7 @@ if [ -z "${panel_url}" ]; then
 fi
 
 panel_url="${panel_url:-${MANAGED_AGENT_PANEL_URL:-${RELEASEPANEL_PANEL_URL:-}}}"
-[ -n "${panel_url}" ] || fail "Usage: managed-deploy join https://panel.example.com   (or MANAGED_AGENT_PANEL_URL / --panel-url=)"
+[ -n "${panel_url}" ] || fail "Usage: bash ${TOOLKIT_DIR}/scripts/join-panel.sh https://panel.example.com   (or MANAGED_AGENT_PANEL_URL / --panel-url=)"
 
 base="${panel_url%/}"
 check_url="${base}/api/runner-connectivity-check"
@@ -117,4 +136,4 @@ case "${MANAGED_AGENT_TAILSCALE_BIND:-}" in
 esac
 
 echo "[join-panel] Running registration (writes agent .env + POST /api/register-runner)..."
-exec bash "${SCRIPT_DIR}/register-server.sh" "${panel_url}"
+exec bash "${TOOLKIT_DIR}/scripts/register-server.sh" "${panel_url}"
