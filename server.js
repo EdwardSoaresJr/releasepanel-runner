@@ -969,17 +969,68 @@ function isEnvRouteSegment(value) {
     return true;
 }
 
+/**
+ * Opt-in: set MANAGED_AGENT_DEBUG_ENV_REQUEST=1 (or RELEASEPANEL_DEBUG_ENV_REQUEST=1) to log
+ * Content-Type, body shape, and route segments for GET/PUT /env/:site/:env before handlers run.
+ */
+function debugEnvRequestMiddleware(request, response, next) {
+    if (!envTruthy('MANAGED_AGENT_DEBUG_ENV_REQUEST', 'RELEASEPANEL_DEBUG_ENV_REQUEST')) {
+        next();
+        return;
+    }
+
+    const body = request.body;
+    let bodyPreview = '';
+    try {
+        if (body === undefined) {
+            bodyPreview = '(undefined)';
+        } else if (body === null) {
+            bodyPreview = '(null)';
+        } else if (typeof body === 'string') {
+            bodyPreview = body.slice(0, 200);
+        } else {
+            bodyPreview = JSON.stringify(body).slice(0, 200);
+        }
+    } catch (err) {
+        bodyPreview = `(preview_error: ${err.message || err})`;
+    }
+
+    console.error('[managed-deploy-agent] env.request', {
+        method: request.method,
+        path: request.originalUrl || request.url,
+        routeSite: request.params.site,
+        routeEnv: request.params.env,
+        contentType: request.headers['content-type'],
+        contentLength: request.headers['content-length'],
+        bodyType: typeof body,
+        bodyPreview,
+    });
+
+    next();
+}
+
 function validateEnvSitePath(request, response, next) {
     const site = request.params.site;
     const env = request.params.env;
 
     if (!isEnvRouteSegment(site) || !isEnvRouteSegment(env)) {
+        if (envTruthy('MANAGED_AGENT_DEBUG_ENV_REQUEST', 'RELEASEPANEL_DEBUG_ENV_REQUEST')) {
+            console.error('[managed-deploy-agent] env.error invalid_route_segments', {
+                site,
+                env,
+                siteOk: isEnvRouteSegment(site),
+                envOk: isEnvRouteSegment(env),
+            });
+        }
         response.status(400).json({
             success: false,
             exit_code: 1,
             stdout: '',
             stderr: `Invalid site/environment: ${site}/${env}`,
             duration_ms: 0,
+            error: 'invalid_env_route_segments',
+            site,
+            environment: env,
         });
         return;
     }
@@ -1743,6 +1794,7 @@ function writeSharedEnv(request, response) {
             response.status(422).json({
                 success: false,
                 message: 'contents must be a string.',
+                error: 'contents_not_string',
             });
             return;
         }
@@ -1754,6 +1806,7 @@ function writeSharedEnv(request, response) {
         response.status(413).json({
             success: false,
             message: '.env content is too large.',
+            error: 'contents_too_large',
         });
         return;
     }
@@ -1762,8 +1815,18 @@ function writeSharedEnv(request, response) {
         response.status(422).json({
             success: false,
             message: '.env content cannot contain null bytes.',
+            error: 'contents_null_byte',
         });
         return;
+    }
+
+    if (envTruthy('MANAGED_AGENT_DEBUG_ENV_REQUEST', 'RELEASEPANEL_DEBUG_ENV_REQUEST')) {
+        console.error('[managed-deploy-agent] env.write.accepted', {
+            envKey: env,
+            path: filePath,
+            contentsChars: contents.length,
+            bodyHadContentsKey: body != null && typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'contents'),
+        });
     }
 
     try {
@@ -2702,12 +2765,12 @@ app.get('/ops/:site/:env/backups', requireApiKey, (request, response) => {
 
 // Remote Laravel shared/.env for a toolkit site (ReleasePanel: GET/PUT /api/.../laravel-env → /env/{site}/{env}).
 // Use validateEnvSitePath (not validateSiteEnv) so slugs are not rejected with 400; missing file is 200 + empty contents in readSharedEnv.
-app.get('/env/:site/:env', validateEnvSitePath, (request, response) => {
+app.get('/env/:site/:env', debugEnvRequestMiddleware, validateEnvSitePath, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     readSharedEnv(request, response);
 });
 
-app.put('/env/:site/:env', validateEnvSitePath, (request, response) => {
+app.put('/env/:site/:env', debugEnvRequestMiddleware, validateEnvSitePath, (request, response) => {
     request.params.env = `${request.params.site}/${request.params.env}`;
     writeSharedEnv(request, response);
 });
