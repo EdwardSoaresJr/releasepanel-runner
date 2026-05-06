@@ -182,7 +182,7 @@ function envPollEnabled(panelUrlNormalized) {
 
 const host = envPair('MANAGED_AGENT_RUNNER_HOST', 'RELEASEPANEL_RUNNER_HOST', '127.0.0.1');
 const port = Number.parseInt(envPair('MANAGED_AGENT_RUNNER_PORT', 'RELEASEPANEL_RUNNER_PORT', '9000'), 10);
-const apiKey = envPair('MANAGED_AGENT_RUNNER_KEY', 'RELEASEPANEL_RUNNER_KEY', '');
+let apiKey = envPair('MANAGED_AGENT_RUNNER_KEY', 'RELEASEPANEL_RUNNER_KEY', '');
 const logPath = envPair('MANAGED_AGENT_RUNNER_LOG', 'RELEASEPANEL_RUNNER_LOG', '/var/log/managed-deploy-agent.log');
 const toolkitPath = path.resolve(
     envPair('MANAGED_AGENT_TOOLKIT_DIR', 'RELEASEPANEL_TOOLKIT_DIR', path.join(__dirname, '..')),
@@ -433,9 +433,21 @@ if (dotenvResult.loadedPath) {
     console.error(`[managed-deploy-agent] no .env found; checked: ${dotenvResult.triedPaths.join(', ')}`);
 }
 
-if (!apiKey || apiKey === 'CHANGE_ME') {
+function joinTokenFromEnv() {
+    return envPair('MANAGED_AGENT_JOIN_TOKEN', 'RELEASEPANEL_JOIN_TOKEN', '').trim();
+}
+
+const awaitingJoinBootstrap = !!joinTokenFromEnv() && (!apiKey || apiKey === '' || apiKey === 'CHANGE_ME');
+
+if ((!apiKey || apiKey === 'CHANGE_ME') && !awaitingJoinBootstrap) {
     console.error('MANAGED_AGENT_RUNNER_KEY (or legacy RELEASEPANEL_RUNNER_KEY) must be set to the same value as RELEASEPANEL_RUNNER_KEY in the panel shared/.env.');
     console.error('Repair: sudo releasepanel heal-self-runner   or copy the key into the runner .env then: sudo systemctl restart managed-deploy-agent');
+    process.exit(1);
+}
+
+if (awaitingJoinBootstrap && (!panelUrl || panelUrl.trim() === '')) {
+    console.error('MANAGED_AGENT_JOIN_TOKEN (or legacy RELEASEPANEL_JOIN_TOKEN) is set without MANAGED_AGENT_PANEL_URL.');
+    console.error('Set the panel URL in .env matching your control plane, then restart.');
     process.exit(1);
 }
 
@@ -618,6 +630,168 @@ async function panelFetchJson(pathname, { method = 'POST', bodyObj = {} } = {}) 
         req.write(bodyStr);
         req.end();
     });
+}
+
+/** POST /api/register-runner with X-JOIN-TOKEN only (before a runner key exists). */
+async function panelPostJoinRegistration(bodyObj, joinTokenPlain) {
+    const targetUrl = `${panelUrl}/api/register-runner`;
+    const bodyStr = JSON.stringify(bodyObj ?? {});
+    const initHeaders = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-JOIN-TOKEN': joinTokenPlain,
+    };
+
+    if (!(panelInsecureTls && targetUrl.startsWith('https:'))) {
+        const res = await fetch(targetUrl, { method: 'POST', headers: initHeaders, body: bodyStr });
+        const text = await res.text();
+        let json = {};
+        try {
+            json = text ? JSON.parse(text) : {};
+        } catch {
+            json = { _parse_error: true };
+        }
+
+        return { ok: res.ok, status: res.status, json };
+    }
+
+    const u = new URL(targetUrl);
+    const headers = { ...initHeaders, 'Content-Length': Buffer.byteLength(bodyStr) };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(
+            {
+                hostname: u.hostname,
+                port: u.port || 443,
+                path: `${u.pathname}${u.search}`,
+                method: 'POST',
+                headers,
+                rejectUnauthorized: false,
+            },
+            (res) => {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => {
+                    const text = Buffer.concat(chunks).toString('utf8');
+                    let json = {};
+                    try {
+                        json = text ? JSON.parse(text) : {};
+                    } catch {
+                        json = { _parse_error: true };
+                    }
+                    resolve({
+                        ok: res.statusCode >= 200 && res.statusCode < 300,
+                        status: res.statusCode || 0,
+                        json,
+                    });
+                });
+            },
+        );
+        req.on('error', reject);
+        req.write(bodyStr);
+        req.end();
+    });
+}
+
+/**
+ * Persist issued runner key and strip join-token lines from .env (one-time join).
+ * @param {string} runnerKeyPlain
+ */
+async function persistRunnerKeyStripJoin(runnerKeyPlain) {
+    const envPath = dotenvResult.loadedPath || path.join(__dirname, '.env');
+    let raw = '';
+    try {
+        raw = await fs.promises.readFile(envPath, 'utf8');
+    } catch {
+        raw = '';
+    }
+    const lines = raw.split(/\r?\n/);
+    const out = [];
+    for (const line of lines) {
+        const t = line.trim();
+        if (
+            /^MANAGED_AGENT_JOIN_TOKEN=/i.test(t)
+            || /^RELEASEPANEL_JOIN_TOKEN=/i.test(t)
+            || /^MANAGED_AGENT_RUNNER_KEY=/i.test(t)
+            || /^RELEASEPANEL_RUNNER_KEY=/i.test(t)
+        ) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.push(`MANAGED_AGENT_RUNNER_KEY=${runnerKeyPlain}`);
+    await fs.promises.writeFile(envPath, `${out.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
+}
+
+let joinRegistrationBusy = false;
+
+function registerIfNeeded() {
+    void registerViaJoinToken();
+}
+
+async function registerViaJoinToken() {
+    const joinToken = joinTokenFromEnv();
+    if (!joinToken) {
+        return;
+    }
+    if (apiKey && apiKey !== 'CHANGE_ME' && apiKey !== '') {
+        return;
+    }
+    if (joinRegistrationBusy) {
+        return;
+    }
+    joinRegistrationBusy = true;
+    try {
+        console.error('[managed-deploy-agent] Registering with panel (join token)...');
+        const hn = os.hostname();
+        /** @type {Record<string, unknown>} */
+        const body = { server_name: hn, hostname: hn };
+        const explicitPublicUrl = envPair('MANAGED_AGENT_RUNNER_PUBLIC_URL', 'RELEASEPANEL_RUNNER_PUBLIC_URL', '').trim();
+        const envPip = envPair('MANAGED_AGENT_RUNNER_PUBLIC_IP', 'RELEASEPANEL_RUNNER_PUBLIC_IP', '').trim();
+        const routableEnvPip = envPip && isRoutablePublicIpv4(envPip) ? envPip : '';
+        let detected = null;
+        if (explicitPublicUrl === '' && !routableEnvPip) {
+            detected = await detectPublicIpv4ForRunner();
+        }
+        if (routableEnvPip) {
+            body.public_ip = routableEnvPip;
+        } else if (detected) {
+            body.public_ip = detected;
+        }
+        if (explicitPublicUrl !== '') {
+            body.runner_url = explicitPublicUrl;
+        } else if (routableEnvPip) {
+            body.runner_url = `http://${routableEnvPip}:${port}`;
+        } else if (detected) {
+            body.runner_url = `http://${detected}:${port}`;
+        }
+
+        const res = await panelPostJoinRegistration(body, joinToken);
+        const data = res.json;
+        if (!res.ok || !data || data.success !== true || typeof data.runner_key !== 'string' || data.runner_key.trim() === '') {
+            console.error('[managed-deploy-agent] Join registration failed:', data || `HTTP ${res.status}`);
+            setTimeout(registerIfNeeded, 5000);
+            return;
+        }
+        apiKey = data.runner_key.trim();
+        process.env.MANAGED_AGENT_RUNNER_KEY = apiKey;
+        delete process.env.MANAGED_AGENT_JOIN_TOKEN;
+        delete process.env.RELEASEPANEL_JOIN_TOKEN;
+        try {
+            await persistRunnerKeyStripJoin(apiKey);
+        } catch (e) {
+            const msg = e && typeof e.message === 'string' ? e.message : String(e);
+            console.error('[managed-deploy-agent] Could not persist runner key to .env:', msg);
+        }
+        console.log('[managed-deploy-agent] Join registration successful');
+        console.log('[managed-deploy-agent] Registered as:', data.server_id);
+    } catch (error) {
+        const msg = error && typeof error.message === 'string' ? error.message : String(error);
+        console.error('[managed-deploy-agent] Join registration error:', msg);
+        setTimeout(registerIfNeeded, 5000);
+    } finally {
+        joinRegistrationBusy = false;
+    }
 }
 
 async function sendHeartbeat() {
@@ -3089,6 +3263,8 @@ async function runAgentPollCycle() {
         pollCycleBusy = false;
     }
 }
+
+registerIfNeeded();
 
 const server = app.listen(port, host, () => {
     appendLog({
