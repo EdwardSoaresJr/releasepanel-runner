@@ -907,15 +907,9 @@ function validateSiteEnv(request, response, next) {
         return;
     }
 
-    if (!fs.existsSync(siteConfigPath(site, env))) {
-        response.status(400).json({
-            success: false,
-            exit_code: 1,
-            stdout: '',
-            stderr: `Site environment config is missing: ${site}/${env}`,
-            duration_ms: 0,
-        });
-        return;
+    const cfgPath = siteConfigPath(site, env);
+    if (!fs.existsSync(cfgPath)) {
+        console.error(`[managed-deploy-agent] No toolkit site env at ${cfgPath} — proceeding (deploy may use panel-injected env).`);
     }
 
     next();
@@ -935,15 +929,10 @@ function validatePromote(request, response, next) {
         return;
     }
 
-    if (!fs.existsSync(siteConfigPath(site, fromEnv)) || !fs.existsSync(siteConfigPath(site, toEnv))) {
-        response.status(400).json({
-            success: false,
-            exit_code: 1,
-            stdout: '',
-            stderr: `Site environment config is missing for promote: ${site}/${fromEnv} -> ${toEnv}`,
-            duration_ms: 0,
-        });
-        return;
+    const fromPath = siteConfigPath(site, fromEnv);
+    const toPath = siteConfigPath(site, toEnv);
+    if (!fs.existsSync(fromPath) || !fs.existsSync(toPath)) {
+        console.error(`[managed-deploy-agent] Missing toolkit env for promote (${site} ${fromEnv}→${toEnv}); continuing.`);
     }
 
     next();
@@ -2635,7 +2624,7 @@ function panelDeployKeyDir() {
     }
 }
 
-function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB64 = null, extraCleanupPaths = null) {
+function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB64 = null, extraCleanupPaths = null, panelPayload = null) {
     const definition = siteActions.deploy;
     const lockKey = `${site}/${env}:deploy`;
 
@@ -2679,6 +2668,23 @@ function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB6
         };
 
         let childEnv = { ...process.env };
+        if (panelPayload && typeof panelPayload === 'object') {
+            const repo = typeof panelPayload.repository_url === 'string' ? panelPayload.repository_url.trim() : '';
+            if (repo !== '') {
+                childEnv.RELEASEPANEL_REPO = repo;
+                childEnv.REPO_URL = repo;
+            }
+            const branch = typeof panelPayload.branch === 'string' ? panelPayload.branch.trim() : '';
+            if (branch !== '') {
+                childEnv.RELEASEPANEL_BRANCH = branch;
+                childEnv.BRANCH = branch;
+            }
+            const domain = typeof panelPayload.domain === 'string' ? panelPayload.domain.trim() : '';
+            if (domain !== '') {
+                childEnv.RELEASEPANEL_SERVER_NAME = domain;
+                childEnv.DOMAIN = domain;
+            }
+        }
         try {
             if (deployKeyB64 && typeof deployKeyB64 === 'string' && deployKeyB64.trim() !== '') {
                 const keyDir = panelDeployKeyDir();
@@ -2847,9 +2853,9 @@ async function executePollDeployJob(job) {
         return;
     }
 
-    if (!fs.existsSync(siteConfigPath(site, env))) {
-        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_site_env_config' }, `Missing site env file for ${site}/${env}`);
-        return;
+    const cfgPath = siteConfigPath(site, env);
+    if (!fs.existsSync(cfgPath)) {
+        console.error(`[managed-deploy-agent] No toolkit site env at ${cfgPath} — running deploy with process/panel-injected env.`);
     }
 
     await reportAgentJobResult(job.id, 'running', {});
@@ -2864,6 +2870,7 @@ async function executePollDeployJob(job) {
             dk.trim() !== '' ? dk : null,
             kh.trim() !== '' ? kh : null,
             cleanupPaths,
+            payload,
         );
         const rawMerged = `${outcome.stdout || ''}\n${outcome.stderr || ''}`;
         const { cleaned, autoPinB64 } = extractAutoPinB64FromDeployOutput(rawMerged);
@@ -3119,14 +3126,15 @@ async function executePollPromoteJob(job) {
     const fromEnv = payload.from_env;
     const toEnv = payload.to_env;
 
-    if (!isSafeSlug(site) || !isSafeSlug(fromEnv) || !isSafeSlug(toEnv)) {
+    if (!isSafeSlug(site) || !isSafeSlug(fromEnv) || !isSafeSlug(toEnv) || fromEnv === toEnv) {
         await reportAgentJobResult(job.id, 'failed', { reason: 'invalid_payload' }, 'Invalid promote payload');
         return;
     }
 
-    if (!fs.existsSync(siteConfigPath(site, fromEnv))) {
-        await reportAgentJobResult(job.id, 'failed', { reason: 'missing_site_env_config' }, `Missing site env file for ${site}/${fromEnv}`);
-        return;
+    const fromPath = siteConfigPath(site, fromEnv);
+    const toPath = siteConfigPath(site, toEnv);
+    if (!fs.existsSync(fromPath) || !fs.existsSync(toPath)) {
+        console.error(`[managed-deploy-agent] Missing toolkit env for promote ${site} (${fromEnv}→${toEnv}); continuing.`);
     }
 
     const lockKey = `${site}/${toEnv}:deploy`;

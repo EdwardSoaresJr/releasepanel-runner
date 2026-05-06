@@ -3,25 +3,60 @@ set -Eeuo pipefail
 
 THIS="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "${THIS}")"
+CLI_NAME="$(basename "${0}")"
 
 if [ "$(basename "${SCRIPT_DIR}")" = "bin" ] && [ -d "${SCRIPT_DIR}/../scripts" ]; then
     TOOLKIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+elif [ "${CLI_NAME}" = "managed-deploy" ]; then
+    TOOLKIT_DIR=""
+    if [ -n "${MANAGED_AGENT_TOOLKIT_DIR:-}" ] && [ -d "${MANAGED_AGENT_TOOLKIT_DIR}/scripts" ]; then
+        TOOLKIT_DIR="${MANAGED_AGENT_TOOLKIT_DIR}"
+    elif [ -n "${RELEASEPANEL_TOOLKIT_DIR:-}" ] && [ -d "${RELEASEPANEL_TOOLKIT_DIR}/scripts" ]; then
+        TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR}"
+    elif [ -d "/opt/managed-deploy-agent/toolkit/scripts" ]; then
+        TOOLKIT_DIR="/opt/managed-deploy-agent/toolkit"
+    elif [ -d "/opt/managed-deploy-agent/scripts" ]; then
+        TOOLKIT_DIR="/opt/managed-deploy-agent"
+    elif [ -d "/opt/releasepanel-runner/toolkit/scripts" ]; then
+        TOOLKIT_DIR="/opt/releasepanel-runner/toolkit"
+    fi
+    if [ -z "${TOOLKIT_DIR}" ]; then
+        echo "[error] ${CLI_NAME}: toolkit not found (need a directory containing scripts/). Set MANAGED_AGENT_TOOLKIT_DIR." >&2
+        exit 1
+    fi
 else
-    TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR:-/opt/managed-deploy-agent/toolkit}"
+    TOOLKIT_DIR="${RELEASEPANEL_TOOLKIT_DIR:-${MANAGED_AGENT_TOOLKIT_DIR:-/opt/releasepanel-deploy}}"
 fi
 
 usage() {
-    cat <<'EOF'
+    local title
+    if [ "${CLI_NAME}" = "managed-deploy" ]; then
+        title="Managed Deploy Agent — operator CLI (runtime stack + deploy hooks). Control plane UI is optional."
+    else
+        title="ReleasePanel deploy toolkit — master host & operator CLI."
+    fi
+
+    cat <<EOF
+${title}
+
 Usage:
-  releasepanel bootstrap
-  releasepanel bootstrap-runner
-  releasepanel mysql status
-  releasepanel redis status
-  releasepanel install-php <php-version>
-  releasepanel runner
-  releasepanel server register <releasepanel-url> [server-name] [runner-url]
-  releasepanel site <command> <site> <environment> [options]
-  releasepanel site promote <site> <from-environment> <to-environment>
+  ${CLI_NAME} self-update [--hard]
+  ${CLI_NAME} bootstrap
+  ${CLI_NAME} bootstrap-runner
+  ${CLI_NAME} bootstrap-releasepanel
+  ${CLI_NAME} heal-self-runner
+  ${CLI_NAME} mysql status
+  ${CLI_NAME} redis status
+  ${CLI_NAME} install-php <php-version>
+  ${CLI_NAME} menu [install-login-hook|uninstall-login-hook]
+  ${CLI_NAME} create-admin
+  ${CLI_NAME} runner
+  ${CLI_NAME} sync-runner
+  ${CLI_NAME} join <panel-url>
+  ${CLI_NAME} server register <panel-url> [server-name] [runner-url]
+  ${CLI_NAME} workers install|restart|status <site> <environment>
+  ${CLI_NAME} site <command> <site> <environment> [options]
+  ${CLI_NAME} site promote <site> <from-environment> <to-environment>
 
 Site commands:
   deploy [--skip-route-cache|--strict]
@@ -32,20 +67,19 @@ Site commands:
   deploy-key
   repair
   nginx
-  selfsigned-nginx
   ssl
   workers
   smoke
   pdf
   harden
 
-This toolkit is the managed-server / agent subset only (app sites + runner). It does not install
-or self-update the ReleasePanel control plane. Use `releasepanel site ... workers` for app queues.
-
 Examples:
-  releasepanel bootstrap-runner
-  releasepanel runner
-  releasepanel site deploy my-app production
+  ${CLI_NAME} bootstrap-runner
+  ${CLI_NAME} join https://panel.example.com
+  ${CLI_NAME} runner
+  ${CLI_NAME} sync-runner
+  ${CLI_NAME} server register https://panel.example.com
+  ${CLI_NAME} site deploy demo-app production
 EOF
 }
 
@@ -97,11 +131,21 @@ run_site_env_script() {
 }
 
 case "${first_arg}" in
+    self-update)
+        run_script self-update.sh "$@"
+        ;;
     bootstrap)
         run_script 01-bootstrap.sh "$@"
         ;;
     bootstrap-runner)
         run_script bootstrap-runner.sh "$@"
+        ;;
+    bootstrap-releasepanel)
+        run_script bootstrap-releasepanel.sh "$@"
+        ;;
+    heal-self-runner)
+        RELEASEPANEL_DEPLOY_ENV="${TOOLKIT_DIR}/sites/releasepanel-app/production.env" \
+            exec bash "${TOOLKIT_DIR}/scripts/heal-releasepanel-self-runner.sh"
         ;;
     mysql)
         case "${1:-status}" in
@@ -110,7 +154,7 @@ case "${first_arg}" in
                 run_script mysql-status.sh status "$@"
                 ;;
             -h | --help | help)
-                echo "Usage: releasepanel mysql status" >&2
+                echo "Usage: ${CLI_NAME} mysql status" >&2
                 ;;
             *)
                 echo "[error] Unknown mysql subcommand: ${1:-}" >&2
@@ -125,7 +169,7 @@ case "${first_arg}" in
                 run_script redis-status.sh "$@"
                 ;;
             -h | --help | help)
-                echo "Usage: releasepanel redis status" >&2
+                echo "Usage: ${CLI_NAME} redis status" >&2
                 ;;
             *)
                 echo "[error] Unknown redis subcommand: ${1:-}" >&2
@@ -140,8 +184,30 @@ case "${first_arg}" in
         fi
         run_script install-php-runtime.sh "$1"
         ;;
+    menu)
+        case "${1:-}" in
+            install-login-hook)
+                bash "${TOOLKIT_DIR}/scripts/install-releasepanel-login-menu.sh" install
+                ;;
+            uninstall-login-hook)
+                bash "${TOOLKIT_DIR}/scripts/install-releasepanel-login-menu.sh" uninstall
+                ;;
+            *)
+                exec bash "${TOOLKIT_DIR}/bin/releasepanel-menu" "$@"
+                ;;
+        esac
+        ;;
+    create-admin)
+        run_script panel-create-admin.sh "$@"
+        ;;
     runner)
         run_script install-runner.sh "$@"
+        ;;
+    sync-runner)
+        run_script sync-releasepanel-runner.sh "$@"
+        ;;
+    join)
+        run_script join-panel.sh "$@"
         ;;
     server)
         if [ "${1:-}" != "register" ]; then
@@ -150,6 +216,16 @@ case "${first_arg}" in
         fi
         shift
         run_script register-server.sh "$@"
+        ;;
+    workers)
+        if [ $# -lt 3 ]; then
+            echo "[error] Usage: ${CLI_NAME} workers install|restart|status <site> <environment>" >&2
+            usage >&2
+            exit 1
+        fi
+        w_cmd="$1"
+        shift
+        bash "${TOOLKIT_DIR}/scripts/workers-panel.sh" "${w_cmd}" "$@"
         ;;
     site)
         if [ $# -lt 2 ]; then
@@ -170,7 +246,7 @@ case "${first_arg}" in
             env_slug="$2"
             promote_target_env="$3"
             shift 3
-        elif [ $# -ge 2 ] && [ -f "${TOOLKIT_DIR}/sites/${1}/${2}.env" ]; then
+        elif [ $# -ge 2 ] && printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]+$' && printf '%s' "$2" | grep -Eq '^[A-Za-z0-9_-]+$'; then
             site_slug="$1"
             env_slug="$2"
             shift 2
@@ -208,7 +284,8 @@ case "${first_arg}" in
                 run_script site-nginx.sh "${site_slug}" "${env_slug}" "$@"
                 ;;
             selfsigned-nginx)
-                run_script site-selfsigned-nginx.sh "${site_slug}" "${env_slug}" "$@"
+                echo "[error] Self-signed TLS for customer sites is not supported. Use HTTP-only (RELEASEPANEL_TLS_MODE=none) or enable Let's Encrypt: releasepanel site ssl ${site_slug} ${env_slug}" >&2
+                exit 1
                 ;;
             ssl)
                 run_script site-ssl.sh "${site_slug}" "${env_slug}" "$@"
@@ -235,7 +312,7 @@ case "${first_arg}" in
                 ;;
         esac
         ;;
-    -h | --help | help)
+    -h|--help|help)
         usage
         ;;
     *)

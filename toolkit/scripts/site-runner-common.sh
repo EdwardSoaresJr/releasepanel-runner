@@ -69,8 +69,7 @@ load_site_env_args() {
     fi
 
     if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
-        echo "[error] Missing site environment config: ${RELEASEPANEL_DEPLOY_ENV}" >&2
-        exit 2
+        printf '%s\n' "[warning] No toolkit site env at ${RELEASEPANEL_DEPLOY_ENV} — continuing (defaults + panel-injected env when used)." >&2
     fi
 
     export SITE_SLUG ENV_SLUG RELEASEPANEL_DEPLOY_ENV SITE_ENV_NAME

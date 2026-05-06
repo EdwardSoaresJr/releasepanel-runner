@@ -21,6 +21,53 @@ fail() {
     exit 1
 }
 
+# Interactive prompts matching scripts/bootstrap-releasepanel.sh (TTY + env pre-fill).
+prompt_value() {
+    local var_name="$1"
+    local prompt="$2"
+    local default="${3:-}"
+    local value="${!var_name:-}"
+
+    if [ -n "${value}" ]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+
+    if [ ! -r /dev/tty ]; then
+        fail "${var_name} is required when no interactive terminal is available."
+    fi
+
+    if [ -n "${default}" ]; then
+        read -r -p "${prompt} [${default}]: " value < /dev/tty
+        value="${value:-${default}}"
+    else
+        read -r -p "${prompt}: " value < /dev/tty
+    fi
+
+    [ -n "${value}" ] || fail "${var_name} is required."
+    printf '%s' "${value}"
+}
+
+prompt_secret() {
+    local var_name="$1"
+    local prompt="$2"
+    local value="${!var_name:-}"
+
+    if [ -n "${value}" ]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+
+    if [ ! -r /dev/tty ]; then
+        fail "${var_name} is required when no interactive terminal is available."
+    fi
+
+    read -r -s -p "${prompt}: " value < /dev/tty
+    printf '\n' > /dev/tty
+    [ -n "${value}" ] || fail "${var_name} is required."
+    printf '%s' "${value}"
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         fail "Run this script as root."
@@ -72,6 +119,10 @@ resolve_site_env_config() {
 parse_deploy_env_as_first_arg() {
     local env_name="$1"
 
+    if [ -n "${SITE_SLUG:-}" ] && [ -n "${ENV_SLUG:-}" ] && [ -n "${RELEASEPANEL_DEPLOY_ENV:-}" ]; then
+        return 0
+    fi
+
     if resolve_site_env_config "${env_name}"; then
         return 0
     fi
@@ -79,22 +130,43 @@ parse_deploy_env_as_first_arg() {
     return 1
 }
 
-load_env() {
-    if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
-        if [ ! -f "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" ]; then
-            fail "Missing ${RELEASEPANEL_DEPLOY_ENV} and ${RELEASEPANEL_TOOLKIT_DIR}/.env.example."
-        fi
+__rp_is_site_toolkit_env_path() {
+    case "${1:-}" in
+        */sites/*/*.env) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-        echo "[releasepanel] Step: Creating deploy.env from .env.example"
-        cp "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" "${RELEASEPANEL_DEPLOY_ENV}"
-        chmod 600 "${RELEASEPANEL_DEPLOY_ENV}"
-        warn "Created ${RELEASEPANEL_DEPLOY_ENV}. Review it before SSL/certbot or production deploy steps."
+load_env() {
+    unset RELEASEPANEL_SITE_ENV_MISSING 2>/dev/null || true
+    local __rp_missing_site_env=0
+
+    if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
+        if __rp_is_site_toolkit_env_path "${RELEASEPANEL_DEPLOY_ENV}"; then
+            if [ "${RELEASEPANEL_REQUIRE_SITE_TOOLKIT_ENV:-0}" = "1" ]; then
+                fail "Missing toolkit site env ${RELEASEPANEL_DEPLOY_ENV} (set RELEASEPANEL_REQUIRE_SITE_TOOLKIT_ENV=0 to allow deploy without it)."
+            fi
+            warn "Missing site env file ${RELEASEPANEL_DEPLOY_ENV} — continuing with slug defaults and process environment (sync from panel or add file when ready)."
+            __rp_missing_site_env=1
+            export RELEASEPANEL_SITE_ENV_MISSING=1
+        else
+            if [ ! -f "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" ]; then
+                fail "Missing ${RELEASEPANEL_DEPLOY_ENV} and ${RELEASEPANEL_TOOLKIT_DIR}/.env.example."
+            fi
+
+            echo "[releasepanel] Step: Creating deploy.env from .env.example"
+            cp "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" "${RELEASEPANEL_DEPLOY_ENV}"
+            chmod 600 "${RELEASEPANEL_DEPLOY_ENV}"
+            warn "Created ${RELEASEPANEL_DEPLOY_ENV}. Review it before SSL/certbot or production deploy steps."
+        fi
     fi
 
-    set -a
-    # shellcheck disable=SC1090
-    . "${RELEASEPANEL_DEPLOY_ENV}"
-    set +a
+    if [ "${__rp_missing_site_env}" -eq 0 ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "${RELEASEPANEL_DEPLOY_ENV}"
+        set +a
+    fi
 
     : "${SITE_SLUG:=${RELEASEPANEL_SITE_SLUG:-site}}"
     : "${ENV_SLUG:=${RELEASEPANEL_ENV_SLUG:-env}}"
@@ -249,6 +321,10 @@ validate_domain_strategy() {
     local alias
 
     if [ -z "${RELEASEPANEL_SERVER_NAME}" ]; then
+        if [ "${RELEASEPANEL_SITE_ENV_MISSING:-0}" = "1" ]; then
+            warn "RELEASEPANEL_SERVER_NAME is unset (no toolkit .env). Set domain on the environment in the panel or sync toolkit envs before nginx/SSL steps."
+            return 0
+        fi
         fail "RELEASEPANEL_SERVER_NAME must be set in site environment config."
     fi
 
@@ -283,6 +359,24 @@ validate_nginx_domain_file() {
         && ! grep -qE '^[[:space:]]*listen[[:space:]]+.*443' "${file}"; then
         fail "nginx config ${file} sets ssl_certificate but has no listen 443 — add e.g. \"listen 443 ssl http2;\" to the TLS server block."
     fi
+}
+
+# Every ssl_certificate PEM path in the file exists (ignores ssl_certificate_key lines).
+nginx_ssl_certificate_pems_exist() {
+    local file="$1"
+    local path
+
+    if [ ! -f "${file}" ]; then
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        path="$(printf '%s' "${line}" | awk '{print $2}' | tr -d ';')"
+        [ -n "${path}" ] || continue
+        [ -f "${path}" ] || return 1
+    done < <(grep -E '^[[:space:]]*ssl_certificate[[:space:]]' "${file}" | grep -Fv 'ssl_certificate_key')
+
+    return 0
 }
 
 run_as_app_user() {
