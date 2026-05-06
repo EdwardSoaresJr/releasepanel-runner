@@ -469,6 +469,7 @@ app.use(rateLimit({
     skip: (request) => request.path === '/health' || request.path === '/api/health',
 }));
 app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
 function appendLog(entry) {
     const line = JSON.stringify({
