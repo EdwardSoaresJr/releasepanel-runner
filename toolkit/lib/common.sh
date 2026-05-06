@@ -137,28 +137,43 @@ __rp_is_site_toolkit_env_path() {
     esac
 }
 
+# Missing, empty (0 bytes), or unreadable site toolkit fragment — treat like missing for optional deploy.
+__rp_site_toolkit_env_unusable() {
+    local p="${1:-}"
+    if ! __rp_is_site_toolkit_env_path "${p}"; then
+        return 1
+    fi
+    if [ ! -f "${p}" ] || [ ! -r "${p}" ]; then
+        return 0
+    fi
+    if [ ! -s "${p}" ]; then
+        return 0
+    fi
+    return 1
+}
+
 load_env() {
     unset RELEASEPANEL_SITE_ENV_MISSING 2>/dev/null || true
     local __rp_missing_site_env=0
 
-    if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
-        if __rp_is_site_toolkit_env_path "${RELEASEPANEL_DEPLOY_ENV}"; then
+    if __rp_is_site_toolkit_env_path "${RELEASEPANEL_DEPLOY_ENV}"; then
+        if __rp_site_toolkit_env_unusable "${RELEASEPANEL_DEPLOY_ENV}"; then
             if [ "${RELEASEPANEL_REQUIRE_SITE_TOOLKIT_ENV:-0}" = "1" ]; then
-                fail "Missing toolkit site env ${RELEASEPANEL_DEPLOY_ENV} (set RELEASEPANEL_REQUIRE_SITE_TOOLKIT_ENV=0 to allow deploy without it)."
+                fail "Missing, empty, or unreadable toolkit site env ${RELEASEPANEL_DEPLOY_ENV} (set RELEASEPANEL_REQUIRE_SITE_TOOLKIT_ENV=0 to allow deploy without it)."
             fi
-            warn "Missing site env file ${RELEASEPANEL_DEPLOY_ENV} — continuing with slug defaults and process environment (sync from panel or add file when ready)."
+            warn "Site toolkit env missing, empty, or unreadable at ${RELEASEPANEL_DEPLOY_ENV} — continuing with slug defaults and process environment (panel job injects repo/domain when used)."
             __rp_missing_site_env=1
             export RELEASEPANEL_SITE_ENV_MISSING=1
-        else
-            if [ ! -f "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" ]; then
-                fail "Missing ${RELEASEPANEL_DEPLOY_ENV} and ${RELEASEPANEL_TOOLKIT_DIR}/.env.example."
-            fi
-
-            echo "[releasepanel] Step: Creating deploy.env from .env.example"
-            cp "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" "${RELEASEPANEL_DEPLOY_ENV}"
-            chmod 600 "${RELEASEPANEL_DEPLOY_ENV}"
-            warn "Created ${RELEASEPANEL_DEPLOY_ENV}. Review it before SSL/certbot or production deploy steps."
         fi
+    elif [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
+        if [ ! -f "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" ]; then
+            fail "Missing ${RELEASEPANEL_DEPLOY_ENV} and ${RELEASEPANEL_TOOLKIT_DIR}/.env.example."
+        fi
+
+        echo "[releasepanel] Step: Creating deploy.env from .env.example"
+        cp "${RELEASEPANEL_TOOLKIT_DIR}/.env.example" "${RELEASEPANEL_DEPLOY_ENV}"
+        chmod 600 "${RELEASEPANEL_DEPLOY_ENV}"
+        warn "Created ${RELEASEPANEL_DEPLOY_ENV}. Review it before SSL/certbot or production deploy steps."
     fi
 
     if [ "${__rp_missing_site_env}" -eq 0 ]; then

@@ -45,7 +45,7 @@ load_site_env_args() {
         exit 2
     fi
 
-    if [ "$#" -ge 2 ] && [ -f "${RELEASEPANEL_TOOLKIT_DIR}/sites/${1}/${2}.env" ]; then
+    if [ "$#" -ge 2 ] && printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]+$' && printf '%s' "$2" | grep -Eq '^[A-Za-z0-9_-]+$'; then
         SITE_SLUG="$1"
         ENV_SLUG="$2"
         shift 2
@@ -68,8 +68,8 @@ load_site_env_args() {
         exit 2
     fi
 
-    if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ]; then
-        printf '%s\n' "[warning] No toolkit site env at ${RELEASEPANEL_DEPLOY_ENV} — continuing (defaults + panel-injected env when used)." >&2
+    if [ ! -f "${RELEASEPANEL_DEPLOY_ENV}" ] || [ ! -r "${RELEASEPANEL_DEPLOY_ENV}" ] || [ ! -s "${RELEASEPANEL_DEPLOY_ENV}" ]; then
+        printf '%s\n' "[warning] Toolkit site env missing, empty, or unreadable at ${RELEASEPANEL_DEPLOY_ENV} — continuing (defaults + panel-injected env when used)." >&2
     fi
 
     export SITE_SLUG ENV_SLUG RELEASEPANEL_DEPLOY_ENV SITE_ENV_NAME

@@ -908,8 +908,8 @@ function validateSiteEnv(request, response, next) {
     }
 
     const cfgPath = siteConfigPath(site, env);
-    if (!fs.existsSync(cfgPath)) {
-        console.error(`[managed-deploy-agent] No toolkit site env at ${cfgPath} — proceeding (deploy may use panel-injected env).`);
+    if (siteToolkitEnvWeak(cfgPath)) {
+        console.error(`[managed-deploy-agent] No usable toolkit site env at ${cfgPath} (missing or empty) — proceeding (deploy may use panel-injected env).`);
     }
 
     next();
@@ -931,8 +931,8 @@ function validatePromote(request, response, next) {
 
     const fromPath = siteConfigPath(site, fromEnv);
     const toPath = siteConfigPath(site, toEnv);
-    if (!fs.existsSync(fromPath) || !fs.existsSync(toPath)) {
-        console.error(`[managed-deploy-agent] Missing toolkit env for promote (${site} ${fromEnv}→${toEnv}); continuing.`);
+    if (siteToolkitEnvWeak(fromPath) || siteToolkitEnvWeak(toPath)) {
+        console.error(`[managed-deploy-agent] Missing or empty toolkit env for promote (${site} ${fromEnv}→${toEnv}); continuing.`);
     }
 
     next();
@@ -1023,6 +1023,23 @@ function deployConfigPath(env) {
 
 function siteConfigPath(site, env) {
     return path.join(toolkitPath, 'sites', site, `${env}.env`);
+}
+
+/** True when file is missing, not a file, empty, or unreadable — matches bash __rp_site_toolkit_env_unusable */
+function siteToolkitEnvWeak(p) {
+    try {
+        if (!fs.existsSync(p)) {
+            return true;
+        }
+        const st = fs.statSync(p);
+        if (!st.isFile() || st.size === 0) {
+            return true;
+        }
+        fs.accessSync(p, fs.constants.R_OK);
+    } catch {
+        return true;
+    }
+    return false;
 }
 
 function listSiteConfigs() {
@@ -2496,9 +2513,8 @@ function runSiteAction(actionName, definition, request, response) {
     });
 }
 
-app.use(requireApiKey);
-
-app.get('/health', (request, response) => {
+/** Public health — must stay before {@link requireApiKey} middleware so probes need no runner key. */
+function handleRunnerHealth(request, response) {
     const healthIp = requesterIp(request);
     const correlationId = runnerCorrelationId(request);
     appendLog({
@@ -2523,7 +2539,12 @@ app.get('/health', (request, response) => {
         stderr: '',
         duration_ms: 0,
     });
-});
+}
+
+app.get('/health', handleRunnerHealth);
+app.get('/api/health', handleRunnerHealth);
+
+app.use(requireApiKey);
 
 app.get('/sites', (request, response) => {
     response.json({
@@ -2854,8 +2875,8 @@ async function executePollDeployJob(job) {
     }
 
     const cfgPath = siteConfigPath(site, env);
-    if (!fs.existsSync(cfgPath)) {
-        console.error(`[managed-deploy-agent] No toolkit site env at ${cfgPath} — running deploy with process/panel-injected env.`);
+    if (siteToolkitEnvWeak(cfgPath)) {
+        console.error(`[managed-deploy-agent] No usable toolkit site env at ${cfgPath} (missing or empty) — running deploy with process/panel-injected env.`);
     }
 
     await reportAgentJobResult(job.id, 'running', {});
@@ -3133,8 +3154,8 @@ async function executePollPromoteJob(job) {
 
     const fromPath = siteConfigPath(site, fromEnv);
     const toPath = siteConfigPath(site, toEnv);
-    if (!fs.existsSync(fromPath) || !fs.existsSync(toPath)) {
-        console.error(`[managed-deploy-agent] Missing toolkit env for promote ${site} (${fromEnv}→${toEnv}); continuing.`);
+    if (siteToolkitEnvWeak(fromPath) || siteToolkitEnvWeak(toPath)) {
+        console.error(`[managed-deploy-agent] Missing or empty toolkit env for promote ${site} (${fromEnv}→${toEnv}); continuing.`);
     }
 
     const lockKey = `${site}/${toEnv}:deploy`;
