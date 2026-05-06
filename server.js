@@ -1637,9 +1637,24 @@ function clearLaravelCaches(env) {
     };
 }
 
+/** When set, log resolved Laravel shared .env path for GET/PUT /env (readSharedEnv / writeSharedEnv). */
+function logEnvPathDebug(phase, envKey, filePath) {
+    if (!envTruthy('MANAGED_AGENT_LOG_ENV_PATH', 'RELEASEPANEL_LOG_ENV_PATH')) {
+        return;
+    }
+    let exists = false;
+    try {
+        exists = fs.existsSync(filePath);
+    } catch (_) {
+        exists = false;
+    }
+    console.error(`[managed-deploy-agent] env.${phase} envKey=${envKey} path=${filePath} exists=${exists}`);
+}
+
 function readSharedEnv(request, response) {
     const env = request.params.env;
     const filePath = sharedEnvPath(env);
+    logEnvPathDebug('read', env, filePath);
     const startedAt = Date.now();
 
     fs.readFile(filePath, 'utf8', (error, contents) => {
@@ -1709,6 +1724,7 @@ function readSharedEnv(request, response) {
 function writeSharedEnv(request, response) {
     const env = request.params.env;
     const filePath = sharedEnvPath(env);
+    logEnvPathDebug('write', env, filePath);
     const contents = request.body?.contents;
     const startedAt = Date.now();
 
