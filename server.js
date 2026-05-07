@@ -316,6 +316,14 @@ const commandRuns = new Map();
 const maxTailBytes = 256 * 1024;
 const maxRunOutputBytes = 512 * 1024;
 const maxAgentPanelOutputChars = 200000;
+const pollDeployStreamMs = Math.max(
+    750,
+    Math.min(
+        120000,
+        Number.parseInt(envPair('MANAGED_AGENT_POLL_DEPLOY_STREAM_MS', 'RELEASEPANEL_POLL_DEPLOY_STREAM_MS', '2000'), 10)
+            || 2000,
+    ),
+);
 const runTtlMs = 30 * 60 * 1000;
 
 function truncateForAgentPanel(text, maxLen) {
@@ -2805,7 +2813,7 @@ function panelDeployKeyDir() {
     }
 }
 
-function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB64 = null, extraCleanupPaths = null, panelPayload = null) {
+function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB64 = null, extraCleanupPaths = null, panelPayload = null, streamJobId = null) {
     const definition = siteActions.deploy;
     const lockKey = `${site}/${env}:deploy`;
 
@@ -2908,6 +2916,36 @@ function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB6
         let stdout = '';
         let stderr = '';
         let timedOut = false;
+        let streamTimer = null;
+        let pollStreamClosing = false;
+
+        async function flushPollDeployLiveOutput() {
+            if (!streamJobId || pollStreamClosing || !panelUrl || String(panelUrl).trim() === '') {
+                return;
+            }
+            const merged = truncateForAgentPanel(`${stdout}\n${stderr}`, maxAgentPanelOutputChars);
+            if (merged.trim() === '') {
+                return;
+            }
+            try {
+                await reportAgentJobResult(streamJobId, 'running', { output: merged });
+            } catch (_) {
+                // Best-effort: never block toolkit exit on telemetry.
+            }
+        }
+
+        function schedulePollDeployLiveFlush() {
+            if (!streamJobId || !panelUrl || String(panelUrl).trim() === '' || pollStreamClosing) {
+                return;
+            }
+            if (streamTimer) {
+                return;
+            }
+            streamTimer = setTimeout(() => {
+                streamTimer = null;
+                void flushPollDeployLiveOutput();
+            }, pollDeployStreamMs);
+        }
 
         const timer = setTimeout(() => {
             timedOut = true;
@@ -2916,10 +2954,12 @@ function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB6
 
         child.stdout.on('data', (chunk) => {
             stdout += chunk.toString();
+            schedulePollDeployLiveFlush();
         });
 
         child.stderr.on('data', (chunk) => {
             stderr += chunk.toString();
+            schedulePollDeployLiveFlush();
         });
 
         child.on('error', (error) => {
@@ -2928,6 +2968,11 @@ function runDeploySyncForPoll(site, env, deployKeyB64 = null, deployKnownHostsB6
         });
 
         child.on('close', (code) => {
+            pollStreamClosing = true;
+            if (streamTimer) {
+                clearTimeout(streamTimer);
+                streamTimer = null;
+            }
             clearTimeout(timer);
             cleanupKey();
 
@@ -3052,6 +3097,7 @@ async function executePollDeployJob(job) {
             kh.trim() !== '' ? kh : null,
             cleanupPaths,
             payload,
+            job.id,
         );
         const rawMerged = `${outcome.stdout || ''}\n${outcome.stderr || ''}`;
         const { cleaned, autoPinB64 } = extractAutoPinB64FromDeployOutput(rawMerged);
